@@ -14,6 +14,13 @@
   "cluster_radius_px": 80.0,
   "max_jump_px": 180.0,
   "smoothing_alpha": 0.35,
+  "min_thruster_distance_px": 50.0,
+  "max_thruster_distance_px": 190.0,
+  "orange_clahe_clip_limit": 2.0,
+  "orange_red_minus_green_min": 8,
+  "orange_green_minus_blue_min": -5,
+  "orange_min_red": 35,
+  "orange_min_green": 20,
   "pool_corners_px": [
     [
       145,

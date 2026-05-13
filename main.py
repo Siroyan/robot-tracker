@@ -34,6 +34,7 @@ import math
 import os
 import csv
 from dataclasses import dataclass, asdict
+from itertools import combinations, permutations
 from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
@@ -41,16 +42,17 @@ import numpy as np
 
 
 Point = Tuple[float, float]
+ThrusterPoints = List[Point]
 
 
 @dataclass
 class TrackerConfig:
     # HSV threshold for orange objects. OpenCV hue range is 0..179.
-    hsv_lower: Tuple[int, int, int] = (5, 80, 50)
-    hsv_upper: Tuple[int, int, int] = (30, 255, 255)
+    hsv_lower: Tuple[int, int, int] = (0, 40, 20)
+    hsv_upper: Tuple[int, int, int] = (40, 255, 255)
 
     # Contour filters.
-    min_area_px: float = 20.0
+    min_area_px: float = 5.0
     max_area_px: float = 30000.0
 
     # Tracking parameters.
@@ -59,6 +61,13 @@ class TrackerConfig:
     cluster_radius_px: float = 80.0
     max_jump_px: float = 180.0
     smoothing_alpha: float = 0.35  # 0=no update, 1=no smoothing
+    min_thruster_distance_px: float = 50.0
+    max_thruster_distance_px: float = 190.0
+    orange_clahe_clip_limit: float = 2.0
+    orange_red_minus_green_min: int = 8
+    orange_green_minus_blue_min: int = -5
+    orange_min_red: int = 35
+    orange_min_green: int = 20
 
     # Optional image-space polygon to suppress orange objects outside the pool.
     # Order: top-left, top-right, bottom-right, bottom-left.
@@ -208,18 +217,55 @@ def transform_point(H: Optional[np.ndarray], p: Optional[Point]) -> Tuple[float,
     return float(dst[0]), float(dst[1])
 
 
-def detect_orange_contours(frame: np.ndarray, cfg: TrackerConfig, pool_mask: Optional[np.ndarray]) -> Tuple[List[Dict[str, float]], np.ndarray]:
-    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-    lower = np.array(cfg.hsv_lower, dtype=np.uint8)
-    upper = np.array(cfg.hsv_upper, dtype=np.uint8)
-    mask = cv2.inRange(hsv, lower, upper)
+def enhance_frame_for_orange(frame: np.ndarray, cfg: TrackerConfig) -> np.ndarray:
+    lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=float(cfg.orange_clahe_clip_limit), tileGridSize=(8, 8))
+    l = clahe.apply(l)
+    enhanced = cv2.merge([l, a, b])
+    enhanced = cv2.cvtColor(enhanced, cv2.COLOR_LAB2BGR)
+    return cv2.GaussianBlur(enhanced, (3, 3), 0)
+
+
+def build_color_mask(
+    frame: np.ndarray,
+    cfg: TrackerConfig,
+    lower_hsv: Tuple[int, int, int],
+    upper_hsv: Tuple[int, int, int],
+    pool_mask: Optional[np.ndarray],
+    *,
+    open_kernel_size: int,
+    open_iterations: int,
+    close_kernel_size: int,
+    close_iterations: int,
+) -> np.ndarray:
+    enhanced = enhance_frame_for_orange(frame, cfg)
+    hsv = cv2.cvtColor(enhanced, cv2.COLOR_BGR2HSV)
+    lower = np.array(lower_hsv, dtype=np.uint8)
+    upper = np.array(upper_hsv, dtype=np.uint8)
+    mask_hsv = cv2.inRange(hsv, lower, upper)
+    bgr_b, bgr_g, bgr_r = cv2.split(enhanced)
+    orange_dominance = (
+        (bgr_r.astype(np.int16) >= bgr_g.astype(np.int16) + int(cfg.orange_red_minus_green_min))
+        & (bgr_g.astype(np.int16) >= bgr_b.astype(np.int16) + int(cfg.orange_green_minus_blue_min))
+        & (bgr_r >= int(cfg.orange_min_red))
+        & (bgr_g >= int(cfg.orange_min_green))
+    )
+    mask = cv2.bitwise_and(mask_hsv, orange_dominance.astype(np.uint8) * 255)
     if pool_mask is not None:
         mask = cv2.bitwise_and(mask, pool_mask)
 
-    kernel = np.ones((5, 5), np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+    if open_iterations > 0:
+        kernel = np.ones((open_kernel_size, open_kernel_size), np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=open_iterations)
+    if close_iterations > 0:
+        kernel = np.ones((close_kernel_size, close_kernel_size), np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=close_iterations)
+    mask = cv2.medianBlur(mask, 3)
+    return mask
 
+
+def extract_detections_from_mask(mask: np.ndarray, cfg: TrackerConfig) -> List[Dict[str, float]]:
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     detections: List[Dict[str, float]] = []
     for c in contours:
@@ -246,56 +292,402 @@ def detect_orange_contours(frame: np.ndarray, cfg: TrackerConfig, pool_mask: Opt
             }
         )
     detections.sort(key=lambda d: d["area"], reverse=True)
-    return detections, mask
+    return detections
+
+
+def detect_orange_contours(frame: np.ndarray, cfg: TrackerConfig, pool_mask: Optional[np.ndarray]) -> Tuple[List[Dict[str, float]], np.ndarray]:
+    mask = build_color_mask(
+        frame,
+        cfg,
+        cfg.hsv_lower,
+        cfg.hsv_upper,
+        pool_mask,
+        open_kernel_size=3,
+        open_iterations=0,
+        close_kernel_size=3,
+        close_iterations=1,
+    )
+    detections = extract_detections_from_mask(mask, cfg)
+    if detections:
+        return detections, mask
+
+    # Fallback: widen HSV range and avoid aggressive erosion when the thrusters are
+    # dim or only occupy a few pixels in the frame.
+    relaxed_lower = (
+        max(0, int(cfg.hsv_lower[0]) - 10),
+        max(0, int(cfg.hsv_lower[1]) - 40),
+        max(0, int(cfg.hsv_lower[2]) - 30),
+    )
+    relaxed_upper = (
+        min(179, int(cfg.hsv_upper[0]) + 20),
+        min(255, int(cfg.hsv_upper[1])),
+        min(255, int(cfg.hsv_upper[2])),
+    )
+    fallback_mask = build_color_mask(
+        frame,
+        cfg,
+        relaxed_lower,
+        relaxed_upper,
+        pool_mask,
+        open_kernel_size=3,
+        open_iterations=0,
+        close_kernel_size=3,
+        close_iterations=0,
+    )
+    fallback_detections = extract_detections_from_mask(fallback_mask, cfg)
+    return fallback_detections, fallback_mask
 
 
 def dist(a: Point, b: Point) -> float:
     return float(math.hypot(a[0] - b[0], a[1] - b[1]))
 
 
-def choose_robot_position(
+def order_thruster_points(points: ThrusterPoints, prev_points: Optional[ThrusterPoints]) -> ThrusterPoints:
+    if len(points) != 4:
+        return points
+    if prev_points is None or len(prev_points) != 4:
+        centroid = (
+            sum(p[0] for p in points) / 4.0,
+            sum(p[1] for p in points) / 4.0,
+        )
+        return sorted(points, key=lambda p: math.atan2(p[1] - centroid[1], p[0] - centroid[0]))
+
+    best: Optional[ThrusterPoints] = None
+    best_score = math.inf
+    for perm in permutations(points):
+        score = sum(dist(perm[i], prev_points[i]) for i in range(4))
+        if score < best_score:
+            best_score = score
+            best = list(perm)
+    return best if best is not None else points
+
+
+def distance_stats(points: ThrusterPoints) -> Tuple[float, float]:
+    pairwise = [dist(points[i], points[j]) for i in range(len(points)) for j in range(i + 1, len(points))]
+    return min(pairwise), max(pairwise)
+
+
+def suppress_nearby_points(points: List[Tuple[float, float, float]], min_distance: float) -> ThrusterPoints:
+    kept: ThrusterPoints = []
+    for x, y, _score in sorted(points, key=lambda t: t[2], reverse=True):
+        point = (float(x), float(y))
+        if all(dist(point, other) >= min_distance for other in kept):
+            kept.append(point)
+    return kept
+
+
+def dedupe_points(points: ThrusterPoints, min_distance: float) -> ThrusterPoints:
+    kept: ThrusterPoints = []
+    for point in points:
+        if all(dist(point, other) >= min_distance for other in kept):
+            kept.append(point)
+    return kept
+
+
+def refine_points_from_mask(mask: np.ndarray, seeds: ThrusterPoints, radius: float) -> ThrusterPoints:
+    ys, xs = np.where(mask > 0)
+    if len(xs) == 0:
+        return []
+    points = np.column_stack([xs, ys]).astype(np.float32)
+    refined: ThrusterPoints = []
+    radius2 = radius * radius
+    for sx, sy in seeds:
+        d2 = (points[:, 0] - sx) ** 2 + (points[:, 1] - sy) ** 2
+        cluster = points[d2 <= radius2]
+        if len(cluster) == 0:
+            return []
+        refined.append((float(cluster[:, 0].mean()), float(cluster[:, 1].mean())))
+    return refined
+
+
+def extract_candidate_points(
+    mask: np.ndarray,
+    detections: List[Dict[str, float]],
+    cfg: TrackerConfig,
+    search_center: Optional[Point],
+) -> ThrusterPoints:
+    candidates: List[Tuple[float, float, float]] = []
+
+    dt = cv2.distanceTransform(mask, cv2.DIST_L2, 5)
+    if float(dt.max()) > 0.0:
+        dilated = cv2.dilate(dt, np.ones((5, 5), np.float32))
+        peak_mask = np.uint8((dt >= dilated - 1e-5) & (dt >= max(1.0, 0.35 * float(dt.max())))) * 255
+        num_labels, _labels, stats, centroids = cv2.connectedComponentsWithStats(peak_mask)
+        for label in range(1, num_labels):
+            if stats[label, cv2.CC_STAT_AREA] <= 0:
+                continue
+            cx, cy = centroids[label]
+            ix = int(np.clip(round(cx), 0, dt.shape[1] - 1))
+            iy = int(np.clip(round(cy), 0, dt.shape[0] - 1))
+            score = float(dt[iy, ix])
+            candidates.append((float(cx), float(cy), score))
+
+    for det in detections:
+        score = math.sqrt(max(float(det["area"]), 1.0))
+        candidates.append((float(det["cx"]), float(det["cy"]), score))
+
+    if search_center is not None:
+        candidates.sort(key=lambda t: dist((t[0], t[1]), search_center))
+
+    deduped = suppress_nearby_points(candidates, cfg.min_thruster_distance_px * 0.55)
+    if search_center is not None:
+        deduped.sort(key=lambda p: dist(p, search_center))
+    return deduped
+
+
+def build_support_mask_from_top_detections(mask: np.ndarray, detections: List[Dict[str, float]]) -> np.ndarray:
+    if not detections:
+        return mask
+    support = np.zeros_like(mask)
+    for det in detections[:3]:
+        x = max(0, int(det["x"]) - 10)
+        y = max(0, int(det["y"]) - 10)
+        x2 = min(mask.shape[1], int(det["x"] + det["w"]) + 10)
+        y2 = min(mask.shape[0], int(det["y"] + det["h"]) + 10)
+        support[y:y2, x:x2] = 255
+    cropped = cv2.bitwise_and(mask, support)
+    return cropped if int(cropped.sum() // 255) >= 16 else mask
+
+
+def select_initial_thruster_points(
+    mask: np.ndarray,
+    detections: List[Dict[str, float]],
+    cfg: TrackerConfig,
+) -> ThrusterPoints:
+    def split_detection(det: Dict[str, float], n_splits: int) -> ThrusterPoints:
+        x0 = max(0, int(det["x"]) - 4)
+        y0 = max(0, int(det["y"]) - 4)
+        x1 = min(mask.shape[1], int(det["x"] + det["w"]) + 4)
+        y1 = min(mask.shape[0], int(det["y"] + det["h"]) + 4)
+        roi = mask[y0:y1, x0:x1]
+        ys, xs = np.where(roi > 0)
+        if len(xs) < n_splits * 4:
+            return []
+        pts = np.column_stack([xs.astype(np.float32) + x0, ys.astype(np.float32) + y0])
+        criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 1.0)
+        _compactness, _labels, centers = cv2.kmeans(pts, n_splits, None, criteria, 8, cv2.KMEANS_PP_CENTERS)
+        return [(float(centers[i, 0]), float(centers[i, 1])) for i in range(n_splits)]
+
+    candidates = extract_candidate_points(mask, detections, cfg, cfg.init_point_px)
+    for det in detections[:4]:
+        candidates.append((float(det["cx"]), float(det["cy"])))
+    if detections:
+        candidates.extend(split_detection(detections[0], 2))
+    if len(detections) >= 2:
+        candidates.extend(split_detection(detections[1], 2))
+    if len(detections) == 3:
+        candidates.extend(split_detection(detections[0], 3))
+
+    candidates = dedupe_points(candidates, 6.0)
+    if cfg.init_point_px is not None:
+        candidates.sort(key=lambda p: dist(p, cfg.init_point_px))
+    if len(candidates) < 4:
+        return []
+
+    best: ThrusterPoints = []
+    best_score = math.inf
+    for combo in combinations(candidates[:14], 4):
+        points = list(combo)
+        min_pair_distance, max_pair_distance = distance_stats(points)
+        if min_pair_distance < 8.0:
+            continue
+        if max_pair_distance > cfg.max_thruster_distance_px * 2.2:
+            continue
+
+        centroid = (
+            sum(p[0] for p in points) / 4.0,
+            sum(p[1] for p in points) / 4.0,
+        )
+        ordered = order_thruster_points(points, None)
+        angles = [math.atan2(p[1] - centroid[1], p[0] - centroid[0]) for p in ordered]
+        unwrapped = angles + [angles[0] + 2.0 * math.pi]
+        gap_penalty = sum(abs((unwrapped[i + 1] - unwrapped[i]) - (math.pi / 2.0)) for i in range(4))
+        score = 1.2 * gap_penalty + 0.02 * max_pair_distance - 0.01 * min_pair_distance
+        if cfg.init_point_px is not None:
+            score += 0.25 * dist(centroid, cfg.init_point_px)
+        score += sum(min(dist(p, q) for q in candidates[:14] if q != p) for p in points) * 0.03
+        if score < best_score:
+            best_score = score
+            best = points
+
+    if len(best) == 4:
+        ordered_best = order_thruster_points(best, None)
+        refined = refine_points_from_mask(mask, best, radius=max(cfg.min_thruster_distance_px * 0.75, 20.0))
+        refined = order_thruster_points(refined, None)
+        if len(refined) == 4 and distance_stats(refined)[0] >= 6.0:
+            return refined
+        return ordered_best
+    return []
+
+
+def localize_thruster_point(
+    mask: np.ndarray,
+    predicted: Point,
+    cfg: TrackerConfig,
+    search_radius: float,
+) -> Optional[Point]:
+    radius_px = int(math.ceil(search_radius))
+    x0 = max(0, int(round(predicted[0])) - radius_px)
+    x1 = min(mask.shape[1], int(round(predicted[0])) + radius_px + 1)
+    y0 = max(0, int(round(predicted[1])) - radius_px)
+    y1 = min(mask.shape[0], int(round(predicted[1])) + radius_px + 1)
+    if x1 > x0 and y1 > y0:
+        roi = mask[y0:y1, x0:x1]
+        ys, xs = np.where(roi > 0)
+        if len(xs) >= 8:
+            global_x = xs.astype(np.float32) + x0
+            global_y = ys.astype(np.float32) + y0
+            d2 = (global_x - predicted[0]) ** 2 + (global_y - predicted[1]) ** 2
+            keep = d2 <= search_radius * search_radius
+            if int(np.count_nonzero(keep)) >= 8:
+                return (float(global_x[keep].mean()), float(global_y[keep].mean()))
+    return None
+
+
+def track_fixed_thrusters(
+    mask: np.ndarray,
+    cfg: TrackerConfig,
+    prev_thruster_points: ThrusterPoints,
+    velocity: Point,
+) -> ThrusterPoints:
+    if len(prev_thruster_points) != 4:
+        return []
+
+    tracked: ThrusterPoints = []
+    search_radius = max(cfg.min_thruster_distance_px * 0.9, 24.0)
+    for prev_point in prev_thruster_points:
+        predicted = (prev_point[0] + velocity[0], prev_point[1] + velocity[1])
+        localized = localize_thruster_point(mask, predicted, cfg, search_radius)
+        if localized is None:
+            localized = localize_thruster_point(mask, predicted, cfg, search_radius * 1.6)
+        if localized is None:
+            return []
+        if any(dist(localized, other) < cfg.min_thruster_distance_px * 0.6 for other in tracked):
+            return []
+        tracked.append(localized)
+
+    min_pair_distance, max_pair_distance = distance_stats(tracked)
+    if min_pair_distance < cfg.min_thruster_distance_px * 0.55:
+        return []
+    if max_pair_distance > cfg.max_thruster_distance_px * 1.25:
+        return []
+    return tracked
+
+
+def estimate_thruster_points(
+    mask: np.ndarray,
     detections: List[Dict[str, float]],
     cfg: TrackerConfig,
     prev_pos: Optional[Point],
     velocity: Point,
-) -> Tuple[Optional[Point], float, int, bool]:
+    prev_thruster_points: Optional[ThrusterPoints] = None,
+) -> ThrusterPoints:
+    def is_valid(points: ThrusterPoints) -> bool:
+        if len(points) != 4:
+            return False
+        min_pair_distance, max_pair_distance = distance_stats(points)
+        return (
+            min_pair_distance >= cfg.min_thruster_distance_px
+            and max_pair_distance <= cfg.max_thruster_distance_px
+        )
+
+    ys, xs = np.where(mask > 0)
+    if len(xs) < 4:
+        return []
+
+    points = np.column_stack([xs, ys]).astype(np.float32)
+    search_center: Optional[Point] = None
+    if prev_pos is not None:
+        search_center = (prev_pos[0] + velocity[0], prev_pos[1] + velocity[1])
+    elif cfg.init_point_px is not None:
+        search_center = cfg.init_point_px
+
+    if search_center is not None:
+        search_radius = max(cfg.max_jump_px * 2.0, cfg.cluster_radius_px * 4.5)
+        d2 = (points[:, 0] - float(search_center[0])) ** 2 + (points[:, 1] - float(search_center[1])) ** 2
+        filtered = points[d2 <= search_radius * search_radius]
+        if len(filtered) >= 4:
+            points = filtered
+
+    if len(points) > 4000:
+        idx = np.linspace(0, len(points) - 1, 4000, dtype=np.int32)
+        points = points[idx]
+
+    work_mask = mask.copy()
+    if search_center is not None:
+        roi_radius = max(cfg.max_jump_px * 1.25, cfg.cluster_radius_px * 3.2)
+        roi = np.zeros_like(mask)
+        cv2.circle(roi, (int(search_center[0]), int(search_center[1])), int(roi_radius), 255, -1)
+        cropped = cv2.bitwise_and(mask, roi)
+        if int(cropped.sum() // 255) >= 12:
+            work_mask = cropped
+
+    dt = cv2.distanceTransform(work_mask, cv2.DIST_L2, 5)
+    if float(dt.max()) > 0.0:
+        dilated = cv2.dilate(dt, np.ones((5, 5), np.float32))
+        peak_mask = np.uint8((dt >= dilated - 1e-5) & (dt >= max(1.5, 0.45 * float(dt.max())))) * 255
+        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(peak_mask)
+        peak_candidates: List[Tuple[float, float, float]] = []
+        for label in range(1, num_labels):
+            if stats[label, cv2.CC_STAT_AREA] <= 0:
+                continue
+            cx, cy = centroids[label]
+            ix = int(np.clip(round(cx), 0, dt.shape[1] - 1))
+            iy = int(np.clip(round(cy), 0, dt.shape[0] - 1))
+            score = float(dt[iy, ix])
+            peak_candidates.append((float(cx), float(cy), score))
+        seeds = suppress_nearby_points(peak_candidates, cfg.min_thruster_distance_px)
+        if len(seeds) == 4:
+            refined = refine_points_from_mask(work_mask, seeds, radius=max(cfg.min_thruster_distance_px * 0.75, 20.0))
+            refined = order_thruster_points(refined, prev_thruster_points)
+            if is_valid(refined):
+                return refined
+
+    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 1.0)
+    _compactness, _labels, centers = cv2.kmeans(points, 4, None, criteria, 8, cv2.KMEANS_PP_CENTERS)
+    thruster_points = [(float(centers[i, 0]), float(centers[i, 1])) for i in range(4)]
+    thruster_points = refine_points_from_mask(work_mask, thruster_points, radius=max(cfg.min_thruster_distance_px * 0.75, 20.0))
+    thruster_points = order_thruster_points(thruster_points, prev_thruster_points)
+    return thruster_points if len(thruster_points) == 4 else []
+
+
+def choose_robot_position(
+    detections: List[Dict[str, float]],
+    mask: np.ndarray,
+    cfg: TrackerConfig,
+    prev_pos: Optional[Point],
+    velocity: Point,
+    prev_thruster_points: Optional[ThrusterPoints],
+) -> Tuple[ThrusterPoints, Optional[Point], float, int, bool]:
     """
-    Selects the orange contour likely to be the robot, then averages nearby contours.
-    Returns: position_px, total_area, n_cluster_contours, detected_reliably
+    Estimates four thruster points from the orange mask and returns their centroid.
+    Returns: thruster_points, centroid_px, total_area, n_thrusters, detected_reliably
     """
     if not detections:
-        return None, 0.0, 0, False
+        return [], None, 0.0, 0, False
+
+    thruster_points = estimate_thruster_points(mask, detections, cfg, prev_pos, velocity, prev_thruster_points)
+    if len(thruster_points) != 4:
+        return [], None, 0.0, len(thruster_points), False
+
+    cx = sum(p[0] for p in thruster_points) / 4.0
+    cy = sum(p[1] for p in thruster_points) / 4.0
+    centroid = (float(cx), float(cy))
+    total_area = float(sum(max(d["area"], 1.0) for d in detections))
 
     if prev_pos is None:
-        if cfg.init_point_px is not None:
-            target = cfg.init_point_px
-            chosen = min(detections, key=lambda d: dist((d["cx"], d["cy"]), target))
-        else:
-            chosen = detections[0]
         reliable = True
     else:
         predicted = (prev_pos[0] + velocity[0], prev_pos[1] + velocity[1])
-        # Prefer candidates close to prediction. Area is a weak tie-breaker.
-        scored = []
-        for d in detections:
-            p = (d["cx"], d["cy"])
-            jump = dist(p, predicted)
-            score = jump - 0.015 * math.sqrt(max(d["area"], 0.0))
-            scored.append((score, jump, d))
-        scored.sort(key=lambda t: t[0])
-        _, jump, chosen = scored[0]
+        jump = dist(centroid, predicted)
         reliable = jump <= cfg.max_jump_px
         if not reliable:
-            return None, 0.0, 0, False
-
-    cp = (chosen["cx"], chosen["cy"])
-    cluster = [d for d in detections if dist((d["cx"], d["cy"]), cp) <= cfg.cluster_radius_px]
-    if not cluster:
-        cluster = [chosen]
-    total_area = sum(max(d["area"], 1.0) for d in cluster)
-    cx = sum(d["cx"] * max(d["area"], 1.0) for d in cluster) / total_area
-    cy = sum(d["cy"] * max(d["area"], 1.0) for d in cluster) / total_area
-    return (float(cx), float(cy)), float(total_area), len(cluster), reliable
+            reacquire_limit = max(cfg.max_jump_px * 2.0, cfg.cluster_radius_px * 3.0)
+            jump = dist(centroid, prev_pos)
+            reliable = jump <= reacquire_limit
+            if not reliable:
+                return [], None, total_area, len(thruster_points), False
+    return thruster_points, centroid, total_area, len(thruster_points), reliable
 
 
 def compute_speeds(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -330,6 +722,16 @@ def write_csv(rows: List[Dict[str, Any]], path: str) -> None:
         "orange_area_px2",
         "cluster_contours",
         "num_orange_candidates",
+        "thruster_1_x",
+        "thruster_1_y",
+        "thruster_2_x",
+        "thruster_2_y",
+        "thruster_3_x",
+        "thruster_3_y",
+        "thruster_4_x",
+        "thruster_4_y",
+        "thruster_min_distance_px",
+        "thruster_max_distance_px",
     ]
     with open(path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -341,6 +743,7 @@ def write_csv(rows: List[Dict[str, Any]], path: str) -> None:
 def draw_annotation(
     frame: np.ndarray,
     detections: List[Dict[str, float]],
+    thruster_points: ThrusterPoints,
     pos_px: Optional[Point],
     pool_xy: Tuple[float, float],
     trail: List[Point],
@@ -363,6 +766,12 @@ def draw_annotation(
         pts = np.array([(int(x), int(y)) for x, y in trail[-200:]], dtype=np.int32)
         cv2.polylines(out, [pts], False, (0, 255, 0), 2)
 
+    for i, point in enumerate(thruster_points, start=1):
+        x, y = int(point[0]), int(point[1])
+        cv2.circle(out, (x, y), 7, (0, 165, 255), 2)
+        cv2.putText(out, str(i), (x + 6, y - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 3, cv2.LINE_AA)
+        cv2.putText(out, str(i), (x + 6, y - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 1, cv2.LINE_AA)
+
     if pos_px is not None:
         x, y = int(pos_px[0]), int(pos_px[1])
         cv2.circle(out, (x, y), 12, (0, 255, 0) if detected else (0, 0, 255), 2)
@@ -375,7 +784,8 @@ def draw_annotation(
         label2 = f"px=({pos_px[0]:.1f}, {pos_px[1]:.1f})"
     else:
         label2 = "position=NaN"
-    for i, text in enumerate([label1, label2]):
+    label3 = f"thrusters={len(thruster_points)}/4"
+    for i, text in enumerate([label1, label2, label3]):
         y = 35 + i * 32
         cv2.putText(out, text, (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 4, cv2.LINE_AA)
         cv2.putText(out, text, (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
@@ -408,7 +818,9 @@ def track_video(args: argparse.Namespace) -> List[Dict[str, Any]]:
         raise RuntimeError("Cannot read first frame")
     pool_mask = build_pool_mask(first_frame.shape, cfg.pool_corners_px)
     H = build_homography(cfg)
-    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+    initial_detections, initial_mask = detect_orange_contours(first_frame, cfg, pool_mask)
+    initial_thruster_points = select_initial_thruster_points(initial_mask, initial_detections, cfg)
+    cap.set(cv2.CAP_PROP_POS_FRAMES, 1)
 
     writer = None
     if args.annotated:
@@ -418,20 +830,46 @@ def track_video(args: argparse.Namespace) -> List[Dict[str, Any]]:
             raise RuntimeError(f"Cannot write annotated video: {args.annotated}")
 
     rows: List[Dict[str, Any]] = []
-    prev_pos: Optional[Point] = cfg.init_point_px
+    prev_pos: Optional[Point] = None
+    prev_thruster_points: Optional[ThrusterPoints] = initial_thruster_points if len(initial_thruster_points) == 4 else None
     smoothed_pos: Optional[Point] = None
     velocity: Point = (0.0, 0.0)
     trail: List[Point] = []
 
     frame_idx = 0
+    pending_first_frame: Optional[np.ndarray] = first_frame
+    pending_first_detections = initial_detections
+    pending_first_mask = initial_mask
     while True:
-        ok, frame = cap.read()
-        if not ok:
-            break
+        if pending_first_frame is not None:
+            frame = pending_first_frame
+            detections = pending_first_detections
+            mask = pending_first_mask
+            pending_first_frame = None
+        else:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            detections, mask = detect_orange_contours(frame, cfg, pool_mask)
         time_s = frame_idx / fps if fps > 0 else float(frame_idx)
-        detections, mask = detect_orange_contours(frame, cfg, pool_mask)
-
-        raw_pos, area, n_cluster, reliable = choose_robot_position(detections, cfg, prev_pos, velocity)
+        if frame_idx == 0 and len(initial_thruster_points) == 4:
+            thruster_points = initial_thruster_points
+            raw_pos = (
+                sum(p[0] for p in thruster_points) / 4.0,
+                sum(p[1] for p in thruster_points) / 4.0,
+            )
+            area = float(sum(max(d["area"], 1.0) for d in detections))
+            n_cluster = 4
+            reliable = True
+        else:
+            thruster_points, raw_pos, area, n_cluster, reliable = choose_robot_position(
+                detections,
+                mask,
+                cfg,
+                prev_pos,
+                velocity,
+                prev_thruster_points,
+            )
         detected = raw_pos is not None and reliable
 
         if detected and raw_pos is not None:
@@ -446,12 +884,19 @@ def track_video(args: argparse.Namespace) -> List[Dict[str, Any]]:
             if prev_pos is not None:
                 velocity = (smoothed_pos[0] - prev_pos[0], smoothed_pos[1] - prev_pos[1])
             prev_pos = smoothed_pos
+            prev_thruster_points = thruster_points
             pos_for_output: Optional[Point] = smoothed_pos
             trail.append(smoothed_pos)
         else:
             pos_for_output = None
 
         pool_xy = transform_point(H, pos_for_output)
+        thruster_min_distance = math.nan
+        thruster_max_distance = math.nan
+        thruster_xy = [(math.nan, math.nan)] * 4
+        if len(thruster_points) == 4:
+            thruster_xy = [(p[0], p[1]) for p in thruster_points]
+            thruster_min_distance, thruster_max_distance = distance_stats(thruster_points)
         rows.append(
             {
                 "frame": frame_idx,
@@ -464,11 +909,21 @@ def track_video(args: argparse.Namespace) -> List[Dict[str, Any]]:
                 "orange_area_px2": area if detected else 0.0,
                 "cluster_contours": n_cluster if detected else 0,
                 "num_orange_candidates": len(detections),
+                "thruster_1_x": thruster_xy[0][0],
+                "thruster_1_y": thruster_xy[0][1],
+                "thruster_2_x": thruster_xy[1][0],
+                "thruster_2_y": thruster_xy[1][1],
+                "thruster_3_x": thruster_xy[2][0],
+                "thruster_3_y": thruster_xy[2][1],
+                "thruster_4_x": thruster_xy[3][0],
+                "thruster_4_y": thruster_xy[3][1],
+                "thruster_min_distance_px": thruster_min_distance,
+                "thruster_max_distance_px": thruster_max_distance,
             }
         )
 
         if writer is not None:
-            annotated = draw_annotation(frame, detections, pos_for_output, pool_xy, trail, cfg, frame_idx, time_s, detected)
+            annotated = draw_annotation(frame, detections, thruster_points, pos_for_output, pool_xy, trail, cfg, frame_idx, time_s, detected)
             writer.write(annotated)
 
         frame_idx += 1
