@@ -1,0 +1,42 @@
+{
+  "hsv_lower": [
+    5,
+    80,
+    50
+  ],
+  "hsv_upper": [
+    30,
+    255,
+    255
+  ],
+  "min_area_px": 20.0,
+  "max_area_px": 30000.0,
+  "cluster_radius_px": 80.0,
+  "max_jump_px": 180.0,
+  "smoothing_alpha": 0.35,
+  "pool_corners_px": [
+    [
+      145,
+      236
+    ],
+    [
+      585,
+      237
+    ],
+    [
+      913,
+      1097
+    ],
+    [
+      -173,
+      1088
+    ]
+  ],
+  "pool_width_m": 2.0,
+  "pool_height_m": 3.0,
+  "init_point_px": [
+    420.0,
+    360.0
+  ],
+  "reference_frame": 0
+}

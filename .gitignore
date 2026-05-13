@@ -1,0 +1,29 @@
+# uv / virtualenv
+.venv/
+
+# Python cache / tooling
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# OS / editor noise
+.DS_Store
+
+# Generated tracker outputs
+movie/
+positions.csv
+annotated.mp4
+reference.jpg
+orange_preview.jpg
+tracker_config.json
