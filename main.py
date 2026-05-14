@@ -45,6 +45,10 @@ Point = Tuple[float, float]
 ThrusterPoints = List[Point]
 
 
+def target_thruster_count(cfg: "TrackerConfig") -> int:
+    return max(1, int(cfg.num_thrusters))
+
+
 @dataclass
 class TrackerConfig:
     # HSV threshold for orange objects. OpenCV hue range is 0..179.
@@ -61,6 +65,7 @@ class TrackerConfig:
     cluster_radius_px: float = 80.0
     max_jump_px: float = 180.0
     smoothing_alpha: float = 0.35  # 0=no update, 1=no smoothing
+    num_thrusters: int = 4
     min_thruster_distance_px: float = 50.0
     max_thruster_distance_px: float = 190.0
     orange_clahe_clip_limit: float = 2.0
@@ -144,8 +149,9 @@ def save_orange_preview(video_path: str, frame_index: int, output_path: str, cfg
     frame = read_frame(video_path, frame_index)
     pool_mask = build_pool_mask(frame.shape, cfg.pool_corners_px)
     detections, mask = detect_orange_contours(frame, cfg, pool_mask)
+    max_markers = max(1, int(cfg.num_thrusters))
     out = frame.copy()
-    for i, d in enumerate(detections[:50], start=1):
+    for i, d in enumerate(detections[:max_markers], start=1):
         x, y, w, h = int(d["x"]), int(d["y"]), int(d["w"]), int(d["h"])
         cx, cy = int(d["cx"]), int(d["cy"])
         cv2.rectangle(out, (x, y), (x + w, y + h), (0, 128, 255), 2)
@@ -156,8 +162,8 @@ def save_orange_preview(video_path: str, frame_index: int, output_path: str, cfg
     if not ok:
         raise RuntimeError(f"Cannot write orange preview: {output_path}")
     print(f"Saved orange preview: {output_path}")
-    print("Orange candidates on reference frame:")
-    for i, d in enumerate(detections[:50], start=1):
+    print(f"Orange candidates on reference frame (showing up to {max_markers}):")
+    for i, d in enumerate(detections[:max_markers], start=1):
         print(f"  #{i}: cx={d['cx']:.1f}, cy={d['cy']:.1f}, area={d['area']:.1f}, bbox=({d['x']:.0f},{d['y']:.0f},{d['w']:.0f},{d['h']:.0f})")
 
 
@@ -343,19 +349,23 @@ def dist(a: Point, b: Point) -> float:
 
 
 def order_thruster_points(points: ThrusterPoints, prev_points: Optional[ThrusterPoints]) -> ThrusterPoints:
-    if len(points) != 4:
+    if prev_points is not None and len(points) != len(prev_points):
         return points
-    if prev_points is None or len(prev_points) != 4:
+    if len(points) <= 1:
+        return points
+    if prev_points is None:
+        n_points = len(points)
         centroid = (
-            sum(p[0] for p in points) / 4.0,
-            sum(p[1] for p in points) / 4.0,
+            sum(p[0] for p in points) / n_points,
+            sum(p[1] for p in points) / n_points,
         )
         return sorted(points, key=lambda p: math.atan2(p[1] - centroid[1], p[0] - centroid[0]))
 
     best: Optional[ThrusterPoints] = None
     best_score = math.inf
+    n_points = len(points)
     for perm in permutations(points):
-        score = sum(dist(perm[i], prev_points[i]) for i in range(4))
+        score = sum(dist(perm[i], prev_points[i]) for i in range(n_points))
         if score < best_score:
             best_score = score
             best = list(perm)
@@ -363,6 +373,8 @@ def order_thruster_points(points: ThrusterPoints, prev_points: Optional[Thruster
 
 
 def distance_stats(points: ThrusterPoints) -> Tuple[float, float]:
+    if len(points) < 2:
+        return (0.0, 0.0)
     pairwise = [dist(points[i], points[j]) for i in range(len(points)) for j in range(i + 1, len(points))]
     return min(pairwise), max(pairwise)
 
@@ -454,6 +466,8 @@ def select_initial_thruster_points(
     detections: List[Dict[str, float]],
     cfg: TrackerConfig,
 ) -> ThrusterPoints:
+    n_thrusters = target_thruster_count(cfg)
+
     def split_detection(det: Dict[str, float], n_splits: int) -> ThrusterPoints:
         x0 = max(0, int(det["x"]) - 4)
         y0 = max(0, int(det["y"]) - 4)
@@ -469,24 +483,25 @@ def select_initial_thruster_points(
         return [(float(centers[i, 0]), float(centers[i, 1])) for i in range(n_splits)]
 
     candidates = extract_candidate_points(mask, detections, cfg, cfg.init_point_px)
-    for det in detections[:4]:
+    for det in detections[:n_thrusters]:
         candidates.append((float(det["cx"]), float(det["cy"])))
-    if detections:
-        candidates.extend(split_detection(detections[0], 2))
-    if len(detections) >= 2:
-        candidates.extend(split_detection(detections[1], 2))
-    if len(detections) == 3:
-        candidates.extend(split_detection(detections[0], 3))
+    if detections and n_thrusters >= 2:
+        candidates.extend(split_detection(detections[0], min(2, n_thrusters)))
+    if len(detections) >= 2 and n_thrusters >= 3:
+        candidates.extend(split_detection(detections[1], min(2, n_thrusters - 1)))
+    if len(detections) == 3 and n_thrusters >= 3:
+        candidates.extend(split_detection(detections[0], min(3, n_thrusters)))
 
     candidates = dedupe_points(candidates, 6.0)
     if cfg.init_point_px is not None:
         candidates.sort(key=lambda p: dist(p, cfg.init_point_px))
-    if len(candidates) < 4:
+    if len(candidates) < n_thrusters:
         return []
 
     best: ThrusterPoints = []
     best_score = math.inf
-    for combo in combinations(candidates[:14], 4):
+    candidate_limit = min(len(candidates), max(n_thrusters + 10, 14))
+    for combo in combinations(candidates[:candidate_limit], n_thrusters):
         points = list(combo)
         min_pair_distance, max_pair_distance = distance_stats(points)
         if min_pair_distance < 8.0:
@@ -495,26 +510,27 @@ def select_initial_thruster_points(
             continue
 
         centroid = (
-            sum(p[0] for p in points) / 4.0,
-            sum(p[1] for p in points) / 4.0,
+            sum(p[0] for p in points) / n_thrusters,
+            sum(p[1] for p in points) / n_thrusters,
         )
         ordered = order_thruster_points(points, None)
         angles = [math.atan2(p[1] - centroid[1], p[0] - centroid[0]) for p in ordered]
         unwrapped = angles + [angles[0] + 2.0 * math.pi]
-        gap_penalty = sum(abs((unwrapped[i + 1] - unwrapped[i]) - (math.pi / 2.0)) for i in range(4))
+        ideal_gap = (2.0 * math.pi) / n_thrusters
+        gap_penalty = sum(abs((unwrapped[i + 1] - unwrapped[i]) - ideal_gap) for i in range(n_thrusters))
         score = 1.2 * gap_penalty + 0.02 * max_pair_distance - 0.01 * min_pair_distance
         if cfg.init_point_px is not None:
             score += 0.25 * dist(centroid, cfg.init_point_px)
-        score += sum(min(dist(p, q) for q in candidates[:14] if q != p) for p in points) * 0.03
+        score += sum(min(dist(p, q) for q in candidates[:candidate_limit] if q != p) for p in points) * 0.03
         if score < best_score:
             best_score = score
             best = points
 
-    if len(best) == 4:
+    if len(best) == n_thrusters:
         ordered_best = order_thruster_points(best, None)
         refined = refine_points_from_mask(mask, best, radius=max(cfg.min_thruster_distance_px * 0.75, 20.0))
         refined = order_thruster_points(refined, None)
-        if len(refined) == 4 and distance_stats(refined)[0] >= 6.0:
+        if len(refined) == n_thrusters and distance_stats(refined)[0] >= 6.0:
             return refined
         return ordered_best
     return []
@@ -550,7 +566,7 @@ def track_fixed_thrusters(
     prev_thruster_points: ThrusterPoints,
     velocity: Point,
 ) -> ThrusterPoints:
-    if len(prev_thruster_points) != 4:
+    if len(prev_thruster_points) != target_thruster_count(cfg):
         return []
 
     tracked: ThrusterPoints = []
@@ -582,8 +598,10 @@ def estimate_thruster_points(
     velocity: Point,
     prev_thruster_points: Optional[ThrusterPoints] = None,
 ) -> ThrusterPoints:
+    n_thrusters = target_thruster_count(cfg)
+
     def is_valid(points: ThrusterPoints) -> bool:
-        if len(points) != 4:
+        if len(points) != n_thrusters:
             return False
         min_pair_distance, max_pair_distance = distance_stats(points)
         return (
@@ -592,7 +610,7 @@ def estimate_thruster_points(
         )
 
     ys, xs = np.where(mask > 0)
-    if len(xs) < 4:
+    if len(xs) < n_thrusters:
         return []
 
     points = np.column_stack([xs, ys]).astype(np.float32)
@@ -606,7 +624,7 @@ def estimate_thruster_points(
         search_radius = max(cfg.max_jump_px * 2.0, cfg.cluster_radius_px * 4.5)
         d2 = (points[:, 0] - float(search_center[0])) ** 2 + (points[:, 1] - float(search_center[1])) ** 2
         filtered = points[d2 <= search_radius * search_radius]
-        if len(filtered) >= 4:
+        if len(filtered) >= n_thrusters:
             points = filtered
 
     if len(points) > 4000:
@@ -637,18 +655,18 @@ def estimate_thruster_points(
             score = float(dt[iy, ix])
             peak_candidates.append((float(cx), float(cy), score))
         seeds = suppress_nearby_points(peak_candidates, cfg.min_thruster_distance_px)
-        if len(seeds) == 4:
+        if len(seeds) == n_thrusters:
             refined = refine_points_from_mask(work_mask, seeds, radius=max(cfg.min_thruster_distance_px * 0.75, 20.0))
             refined = order_thruster_points(refined, prev_thruster_points)
             if is_valid(refined):
                 return refined
 
     criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 1.0)
-    _compactness, _labels, centers = cv2.kmeans(points, 4, None, criteria, 8, cv2.KMEANS_PP_CENTERS)
-    thruster_points = [(float(centers[i, 0]), float(centers[i, 1])) for i in range(4)]
+    _compactness, _labels, centers = cv2.kmeans(points, n_thrusters, None, criteria, 8, cv2.KMEANS_PP_CENTERS)
+    thruster_points = [(float(centers[i, 0]), float(centers[i, 1])) for i in range(n_thrusters)]
     thruster_points = refine_points_from_mask(work_mask, thruster_points, radius=max(cfg.min_thruster_distance_px * 0.75, 20.0))
     thruster_points = order_thruster_points(thruster_points, prev_thruster_points)
-    return thruster_points if len(thruster_points) == 4 else []
+    return thruster_points if len(thruster_points) == n_thrusters else []
 
 
 def choose_robot_position(
@@ -666,12 +684,13 @@ def choose_robot_position(
     if not detections:
         return [], None, 0.0, 0, False
 
+    n_thrusters = target_thruster_count(cfg)
     thruster_points = estimate_thruster_points(mask, detections, cfg, prev_pos, velocity, prev_thruster_points)
-    if len(thruster_points) != 4:
+    if len(thruster_points) != n_thrusters:
         return [], None, 0.0, len(thruster_points), False
 
-    cx = sum(p[0] for p in thruster_points) / 4.0
-    cy = sum(p[1] for p in thruster_points) / 4.0
+    cx = sum(p[0] for p in thruster_points) / n_thrusters
+    cy = sum(p[1] for p in thruster_points) / n_thrusters
     centroid = (float(cx), float(cy))
     total_area = float(sum(max(d["area"], 1.0) for d in detections))
 
@@ -709,7 +728,7 @@ def compute_speeds(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return rows
 
 
-def write_csv(rows: List[Dict[str, Any]], path: str) -> None:
+def write_csv(rows: List[Dict[str, Any]], path: str, num_thrusters: int) -> None:
     fieldnames = [
         "frame",
         "time_s",
@@ -722,17 +741,11 @@ def write_csv(rows: List[Dict[str, Any]], path: str) -> None:
         "orange_area_px2",
         "cluster_contours",
         "num_orange_candidates",
-        "thruster_1_x",
-        "thruster_1_y",
-        "thruster_2_x",
-        "thruster_2_y",
-        "thruster_3_x",
-        "thruster_3_y",
-        "thruster_4_x",
-        "thruster_4_y",
         "thruster_min_distance_px",
         "thruster_max_distance_px",
     ]
+    for idx in range(1, num_thrusters + 1):
+        fieldnames.extend([f"thruster_{idx}_x", f"thruster_{idx}_y"])
     with open(path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
@@ -753,6 +766,7 @@ def draw_annotation(
     detected: bool,
 ) -> np.ndarray:
     out = frame.copy()
+    n_thrusters = target_thruster_count(cfg)
 
     if cfg.pool_corners_px is not None:
         pts = np.array(cfg.pool_corners_px, dtype=np.int32)
@@ -784,7 +798,7 @@ def draw_annotation(
         label2 = f"px=({pos_px[0]:.1f}, {pos_px[1]:.1f})"
     else:
         label2 = "position=NaN"
-    label3 = f"thrusters={len(thruster_points)}/4"
+    label3 = f"thrusters={len(thruster_points)}/{n_thrusters}"
     for i, text in enumerate([label1, label2, label3]):
         y = 35 + i * 32
         cv2.putText(out, text, (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 4, cv2.LINE_AA)
@@ -794,6 +808,7 @@ def draw_annotation(
 
 def track_video(args: argparse.Namespace) -> List[Dict[str, Any]]:
     cfg = load_config(args.config)
+    n_thrusters = target_thruster_count(cfg)
     if args.pool_width_m is not None:
         cfg.pool_width_m = args.pool_width_m
     if args.pool_height_m is not None:
@@ -831,7 +846,7 @@ def track_video(args: argparse.Namespace) -> List[Dict[str, Any]]:
 
     rows: List[Dict[str, Any]] = []
     prev_pos: Optional[Point] = None
-    prev_thruster_points: Optional[ThrusterPoints] = initial_thruster_points if len(initial_thruster_points) == 4 else None
+    prev_thruster_points: Optional[ThrusterPoints] = initial_thruster_points if len(initial_thruster_points) == n_thrusters else None
     smoothed_pos: Optional[Point] = None
     velocity: Point = (0.0, 0.0)
     trail: List[Point] = []
@@ -852,14 +867,14 @@ def track_video(args: argparse.Namespace) -> List[Dict[str, Any]]:
                 break
             detections, mask = detect_orange_contours(frame, cfg, pool_mask)
         time_s = frame_idx / fps if fps > 0 else float(frame_idx)
-        if frame_idx == 0 and len(initial_thruster_points) == 4:
+        if frame_idx == 0 and len(initial_thruster_points) == n_thrusters:
             thruster_points = initial_thruster_points
             raw_pos = (
-                sum(p[0] for p in thruster_points) / 4.0,
-                sum(p[1] for p in thruster_points) / 4.0,
+                sum(p[0] for p in thruster_points) / n_thrusters,
+                sum(p[1] for p in thruster_points) / n_thrusters,
             )
             area = float(sum(max(d["area"], 1.0) for d in detections))
-            n_cluster = 4
+            n_cluster = n_thrusters
             reliable = True
         else:
             thruster_points, raw_pos, area, n_cluster, reliable = choose_robot_position(
@@ -893,34 +908,28 @@ def track_video(args: argparse.Namespace) -> List[Dict[str, Any]]:
         pool_xy = transform_point(H, pos_for_output)
         thruster_min_distance = math.nan
         thruster_max_distance = math.nan
-        thruster_xy = [(math.nan, math.nan)] * 4
-        if len(thruster_points) == 4:
+        thruster_xy = [(math.nan, math.nan)] * n_thrusters
+        if len(thruster_points) == n_thrusters:
             thruster_xy = [(p[0], p[1]) for p in thruster_points]
             thruster_min_distance, thruster_max_distance = distance_stats(thruster_points)
-        rows.append(
-            {
-                "frame": frame_idx,
-                "time_s": time_s,
-                "detected": bool(detected),
-                "px_x": pos_for_output[0] if pos_for_output is not None else math.nan,
-                "px_y": pos_for_output[1] if pos_for_output is not None else math.nan,
-                "pool_x_m": pool_xy[0],
-                "pool_y_m": pool_xy[1],
-                "orange_area_px2": area if detected else 0.0,
-                "cluster_contours": n_cluster if detected else 0,
-                "num_orange_candidates": len(detections),
-                "thruster_1_x": thruster_xy[0][0],
-                "thruster_1_y": thruster_xy[0][1],
-                "thruster_2_x": thruster_xy[1][0],
-                "thruster_2_y": thruster_xy[1][1],
-                "thruster_3_x": thruster_xy[2][0],
-                "thruster_3_y": thruster_xy[2][1],
-                "thruster_4_x": thruster_xy[3][0],
-                "thruster_4_y": thruster_xy[3][1],
-                "thruster_min_distance_px": thruster_min_distance,
-                "thruster_max_distance_px": thruster_max_distance,
-            }
-        )
+        row = {
+            "frame": frame_idx,
+            "time_s": time_s,
+            "detected": bool(detected),
+            "px_x": pos_for_output[0] if pos_for_output is not None else math.nan,
+            "px_y": pos_for_output[1] if pos_for_output is not None else math.nan,
+            "pool_x_m": pool_xy[0],
+            "pool_y_m": pool_xy[1],
+            "orange_area_px2": area if detected else 0.0,
+            "cluster_contours": n_cluster if detected else 0,
+            "num_orange_candidates": len(detections),
+            "thruster_min_distance_px": thruster_min_distance,
+            "thruster_max_distance_px": thruster_max_distance,
+        }
+        for idx in range(n_thrusters):
+            row[f"thruster_{idx + 1}_x"] = thruster_xy[idx][0]
+            row[f"thruster_{idx + 1}_y"] = thruster_xy[idx][1]
+        rows.append(row)
 
         if writer is not None:
             annotated = draw_annotation(frame, detections, thruster_points, pos_for_output, pool_xy, trail, cfg, frame_idx, time_s, detected)
@@ -939,7 +948,7 @@ def track_video(args: argparse.Namespace) -> List[Dict[str, Any]]:
             row["speed_mps"] = math.nan
 
     if args.csv:
-        write_csv(rows, args.csv)
+        write_csv(rows, args.csv, n_thrusters)
         print(f"Saved CSV: {args.csv}")
     return rows
 

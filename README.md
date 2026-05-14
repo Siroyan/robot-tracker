@@ -12,6 +12,7 @@
 - 初期点と前フレーム位置を使ったロボット候補の選定
 - 近傍候補のクラスタ平均による位置推定
 - 平滑化による位置の安定化
+- 設定したスラスタ数に応じた候補表示と座標出力
 - プール四隅と実寸に基づくメートル座標への変換
 - フレームごとの CSV 出力
 - 注釈付き動画の出力
@@ -27,14 +28,6 @@
 - `numpy`
 
 ## セットアップ
-
-`pip` を使う場合:
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements_tracker.txt
-```
 
 `uv` を使う場合:
 
@@ -54,7 +47,7 @@ uv sync
 設定に使う基準フレームを画像として保存します。
 
 ```bash
-python3 main.py movie/20260509_173657.mp4 \
+uv run python main.py movie/20260509_173657.mp4 \
   --reference-frame 0 \
   --export-reference-frame reference.jpg
 ```
@@ -64,7 +57,7 @@ python3 main.py movie/20260509_173657.mp4 \
 HSV 閾値でどの領域が候補になるかを画像で確認します。
 
 ```bash
-python3 main.py movie/20260509_173657.mp4 \
+uv run python main.py movie/20260509_173657.mp4 \
   --config tracker_config_example.json \
   --reference-frame 0 \
   --export-orange-preview orange_preview.jpg
@@ -73,7 +66,7 @@ python3 main.py movie/20260509_173657.mp4 \
 必要に応じて CLI から HSV を上書きできます。
 
 ```bash
-python3 main.py movie/20260509_173657.mp4 \
+uv run python main.py movie/20260509_173657.mp4 \
   --config tracker_config_example.json \
   --hsv-lower 5 80 50 \
   --hsv-upper 30 255 255 \
@@ -85,7 +78,7 @@ python3 main.py movie/20260509_173657.mp4 \
 GUI はないため、参照画像を見ながらプール四隅と初期位置を手入力します。
 
 ```bash
-python3 main.py movie/20260509_173657.mp4 \
+uv run python main.py movie/20260509_173657.mp4 \
   --make-config tracker_config.json \
   --reference-frame 0 \
   --pool-width-m 2.0 \
@@ -106,7 +99,7 @@ python3 main.py movie/20260509_173657.mp4 \
 ### 4. トラッキングを実行する
 
 ```bash
-python3 main.py movie/20260509_173657.mp4 \
+uv run python main.py movie/20260509_173657.mp4 \
   --config tracker_config.json \
   --csv positions.csv \
   --annotated annotated.mp4
@@ -117,6 +110,8 @@ python3 main.py movie/20260509_173657.mp4 \
 - 追跡結果 CSV
 - 任意で注釈付き MP4
 - 標準出力に総フレーム数、検出率、メートル座標範囲
+
+`num_thrusters` を設定すると、`orange_preview` ではその数を超える番号付きマーカーを表示しません。
 
 ## 出力 CSV
 
@@ -131,6 +126,8 @@ CSV には以下の列が出力されます。
 - `orange_area_px2`: 採用クラスタの面積合計
 - `cluster_contours`: 採用クラスタに含まれた輪郭数
 - `num_orange_candidates`: そのフレームで見つかったオレンジ候補数
+- `thruster_min_distance_px`, `thruster_max_distance_px`: 採用したスラスタ点同士の最小/最大距離
+- `thruster_1_x`, `thruster_1_y` ... `thruster_N_x`, `thruster_N_y`: `num_thrusters` に応じて出力される各スラスタ点の画素座標
 
 プール四隅またはプール実寸が未設定の場合、`pool_x_m`、`pool_y_m`、`speed_mps` は `NaN` になります。
 
@@ -148,6 +145,16 @@ CSV には以下の列が出力されます。
   - 前フレーム予測位置から許容する最大移動量
 - `smoothing_alpha`
   - 平滑化係数
+- `num_thrusters`
+  - 追跡対象とみなすスラスタ数。`orange_preview` の表示数と CSV のスラスタ列数にも反映
+- `min_thruster_distance_px`, `max_thruster_distance_px`
+  - スラスタ点同士の距離制約
+- `orange_clahe_clip_limit`
+  - オレンジ抽出前の CLAHE 強度
+- `orange_red_minus_green_min`, `orange_green_minus_blue_min`
+  - RGB 成分差によるオレンジ判定条件
+- `orange_min_red`, `orange_min_green`
+  - RGB 成分の最小値条件
 - `pool_corners_px`
   - プール領域の四隅画素座標
 - `pool_width_m`, `pool_height_m`
@@ -189,6 +196,7 @@ CSV には以下の列が出力されます。
 ## 実装上の制約
 
 - 色ベース追跡なので、水面反射や照明変化、類似色の物体に影響を受けます。
+- `num_thrusters` は一般化されていますが、初期化と追跡の安定性は動画品質とマスク品質に強く依存します。
 - `init_point_px` が未設定だと、最初のフレームでは最大のオレンジ領域をロボットとみなします。
 - ロボットが急に大きく移動した場合、`max_jump_px` を超えると未検出になります。
 - トラッキングは単一オブジェクト前提です。
