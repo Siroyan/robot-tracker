@@ -152,7 +152,7 @@ def save_reference_frame(video_path: str, frame_index: int, output_path: str) ->
 def save_orange_preview(video_path: str, frame_index: int, output_path: str, cfg: TrackerConfig) -> None:
     frame = read_frame(video_path, frame_index)
     pool_mask = build_pool_mask(frame.shape, cfg.pool_corners_px)
-    detections, mask = detect_orange_contours(frame, cfg, pool_mask)
+    detections, mask, _relaxed_mask = detect_orange_contours(frame, cfg, pool_mask)
     max_markers = max(1, int(cfg.num_thrusters))
     selected_points = select_initial_thruster_points(mask, detections, cfg)
     out = frame.copy()
@@ -314,7 +314,11 @@ def extract_detections_from_mask(mask: np.ndarray, cfg: TrackerConfig) -> List[D
     return detections
 
 
-def detect_orange_contours(frame: np.ndarray, cfg: TrackerConfig, pool_mask: Optional[np.ndarray]) -> Tuple[List[Dict[str, float]], np.ndarray]:
+def detect_orange_contours(
+    frame: np.ndarray,
+    cfg: TrackerConfig,
+    pool_mask: Optional[np.ndarray],
+) -> Tuple[List[Dict[str, float]], np.ndarray, np.ndarray]:
     mask = build_color_mask(
         frame,
         cfg,
@@ -327,8 +331,6 @@ def detect_orange_contours(frame: np.ndarray, cfg: TrackerConfig, pool_mask: Opt
         close_iterations=1,
     )
     detections = extract_detections_from_mask(mask, cfg)
-    if detections:
-        return detections, mask
 
     # Fallback: widen HSV range and avoid aggressive erosion when the thrusters are
     # dim or only occupy a few pixels in the frame.
@@ -342,7 +344,7 @@ def detect_orange_contours(frame: np.ndarray, cfg: TrackerConfig, pool_mask: Opt
         min(255, int(cfg.hsv_upper[1])),
         min(255, int(cfg.hsv_upper[2])),
     )
-    fallback_mask = build_color_mask(
+    relaxed_mask = build_color_mask(
         frame,
         cfg,
         relaxed_lower,
@@ -353,8 +355,10 @@ def detect_orange_contours(frame: np.ndarray, cfg: TrackerConfig, pool_mask: Opt
         close_kernel_size=3,
         close_iterations=0,
     )
-    fallback_detections = extract_detections_from_mask(fallback_mask, cfg)
-    return fallback_detections, fallback_mask
+    fallback_detections = extract_detections_from_mask(relaxed_mask, cfg)
+    if detections:
+        return detections, mask, relaxed_mask
+    return fallback_detections, relaxed_mask, relaxed_mask
 
 
 def dist(a: Point, b: Point) -> float:
@@ -580,6 +584,7 @@ def clamp_vector(vec: Point, max_norm: float) -> Point:
 
 def track_fixed_thrusters(
     mask: np.ndarray,
+    relaxed_mask: np.ndarray,
     cfg: TrackerConfig,
     prev_thruster_points: ThrusterPoints,
     prev_thruster_velocities: Optional[ThrusterVelocities],
@@ -613,6 +618,14 @@ def track_fixed_thrusters(
             localized = localize_thruster_point(working_mask, predicted, cfg, reacquire_radius)
         if localized is None:
             localized = localize_thruster_point(working_mask, prev_point, cfg, reacquire_radius)
+        if localized is None:
+            localized = localize_thruster_point(relaxed_mask, predicted, cfg, search_radius)
+        if localized is None:
+            localized = localize_thruster_point(relaxed_mask, prev_point, cfg, search_radius)
+        if localized is None:
+            localized = localize_thruster_point(relaxed_mask, predicted, cfg, reacquire_radius)
+        if localized is None:
+            localized = localize_thruster_point(relaxed_mask, prev_point, cfg, reacquire_radius)
         if localized is None:
             localized = prev_point
             had_hold = True
@@ -719,6 +732,7 @@ def estimate_thruster_points(
 def choose_robot_position(
     detections: List[Dict[str, float]],
     mask: np.ndarray,
+    relaxed_mask: np.ndarray,
     cfg: TrackerConfig,
     prev_pos: Optional[Point],
     velocity: Point,
@@ -736,7 +750,7 @@ def choose_robot_position(
     thruster_points: ThrusterPoints = []
     tracking_mode = "global"
     if prev_thruster_points is not None and len(prev_thruster_points) == n_thrusters:
-        thruster_points, had_hold = track_fixed_thrusters(mask, cfg, prev_thruster_points, prev_thruster_velocities, velocity)
+        thruster_points, had_hold = track_fixed_thrusters(mask, relaxed_mask, cfg, prev_thruster_points, prev_thruster_velocities, velocity)
         if len(thruster_points) == n_thrusters:
             tracking_mode = "hold" if had_hold else "roi"
     if len(thruster_points) != n_thrusters:
@@ -908,7 +922,7 @@ def track_video(args: argparse.Namespace) -> List[Dict[str, Any]]:
         raise RuntimeError("Cannot read first frame")
     pool_mask = build_pool_mask(first_frame.shape, cfg.pool_corners_px)
     H = build_homography(cfg)
-    initial_detections, initial_mask = detect_orange_contours(first_frame, cfg, pool_mask)
+    initial_detections, initial_mask, initial_relaxed_mask = detect_orange_contours(first_frame, cfg, pool_mask)
     initial_thruster_points = select_initial_thruster_points(initial_mask, initial_detections, cfg)
     cap.set(cv2.CAP_PROP_POS_FRAMES, 1)
 
@@ -931,18 +945,20 @@ def track_video(args: argparse.Namespace) -> List[Dict[str, Any]]:
     pending_first_frame: Optional[np.ndarray] = first_frame
     pending_first_detections = initial_detections
     pending_first_mask = initial_mask
+    pending_first_relaxed_mask = initial_relaxed_mask
     while True:
         roi_centers: Optional[ThrusterPoints] = None
         if pending_first_frame is not None:
             frame = pending_first_frame
             detections = pending_first_detections
             mask = pending_first_mask
+            relaxed_mask = pending_first_relaxed_mask
             pending_first_frame = None
         else:
             ok, frame = cap.read()
             if not ok:
                 break
-            detections, mask = detect_orange_contours(frame, cfg, pool_mask)
+            detections, mask, relaxed_mask = detect_orange_contours(frame, cfg, pool_mask)
         time_s = frame_idx / fps if fps > 0 else float(frame_idx)
         if frame_idx == 0 and len(initial_thruster_points) == n_thrusters:
             thruster_points = initial_thruster_points
@@ -984,6 +1000,7 @@ def track_video(args: argparse.Namespace) -> List[Dict[str, Any]]:
             thruster_points, raw_pos, area, n_cluster, reliable, tracking_mode = choose_robot_position(
                 detections,
                 mask,
+                relaxed_mask,
                 cfg,
                 prev_pos,
                 velocity,
