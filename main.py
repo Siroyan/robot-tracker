@@ -43,6 +43,7 @@ import numpy as np
 
 Point = Tuple[float, float]
 ThrusterPoints = List[Point]
+ThrusterVelocities = List[Point]
 
 
 def target_thruster_count(cfg: "TrackerConfig") -> int:
@@ -68,6 +69,9 @@ class TrackerConfig:
     num_thrusters: int = 4
     min_thruster_distance_px: float = 50.0
     max_thruster_distance_px: float = 190.0
+    thruster_search_radius_px: float = 18.0
+    thruster_reacquire_radius_px: float = 30.0
+    thruster_max_step_px: float = 8.0
     orange_clahe_clip_limit: float = 2.0
     orange_red_minus_green_min: int = 8
     orange_green_minus_blue_min: int = -5
@@ -150,14 +154,19 @@ def save_orange_preview(video_path: str, frame_index: int, output_path: str, cfg
     pool_mask = build_pool_mask(frame.shape, cfg.pool_corners_px)
     detections, mask = detect_orange_contours(frame, cfg, pool_mask)
     max_markers = max(1, int(cfg.num_thrusters))
+    selected_points = select_initial_thruster_points(mask, detections, cfg)
     out = frame.copy()
-    for i, d in enumerate(detections[:max_markers], start=1):
+    for d in detections[: max(max_markers + 4, 8)]:
         x, y, w, h = int(d["x"]), int(d["y"]), int(d["w"]), int(d["h"])
         cx, cy = int(d["cx"]), int(d["cy"])
-        cv2.rectangle(out, (x, y), (x + w, y + h), (0, 128, 255), 2)
-        cv2.circle(out, (cx, cy), 5, (0, 255, 255), -1)
+        cv2.rectangle(out, (x, y), (x + w, y + h), (0, 128, 255), 1)
+        cv2.circle(out, (cx, cy), 4, (0, 165, 255), -1)
+
+    for i, point in enumerate(selected_points[:max_markers], start=1):
+        cx, cy = int(round(point[0])), int(round(point[1]))
+        cv2.circle(out, (cx, cy), 8, (0, 255, 0), 2)
         cv2.putText(out, str(i), (cx + 8, cy - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 4, cv2.LINE_AA)
-        cv2.putText(out, str(i), (cx + 8, cy - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2, cv2.LINE_AA)
+        cv2.putText(out, str(i), (cx + 8, cy - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2, cv2.LINE_AA)
     ok = cv2.imwrite(output_path, out)
     if not ok:
         raise RuntimeError(f"Cannot write orange preview: {output_path}")
@@ -165,6 +174,10 @@ def save_orange_preview(video_path: str, frame_index: int, output_path: str, cfg
     print(f"Orange candidates on reference frame (showing up to {max_markers}):")
     for i, d in enumerate(detections[:max_markers], start=1):
         print(f"  #{i}: cx={d['cx']:.1f}, cy={d['cy']:.1f}, area={d['area']:.1f}, bbox=({d['x']:.0f},{d['y']:.0f},{d['w']:.0f},{d['h']:.0f})")
+    if selected_points:
+        print("Selected initial thruster points:")
+        for i, point in enumerate(selected_points[:max_markers], start=1):
+            print(f"  T{i}: x={point[0]:.1f}, y={point[1]:.1f}")
 
 
 def make_config_headless(args: argparse.Namespace) -> None:
@@ -482,58 +495,39 @@ def select_initial_thruster_points(
         _compactness, _labels, centers = cv2.kmeans(pts, n_splits, None, criteria, 8, cv2.KMEANS_PP_CENTERS)
         return [(float(centers[i, 0]), float(centers[i, 1])) for i in range(n_splits)]
 
-    candidates = extract_candidate_points(mask, detections, cfg, cfg.init_point_px)
-    for det in detections[:n_thrusters]:
-        candidates.append((float(det["cx"]), float(det["cy"])))
-    if detections and n_thrusters >= 2:
-        candidates.extend(split_detection(detections[0], min(2, n_thrusters)))
-    if len(detections) >= 2 and n_thrusters >= 3:
-        candidates.extend(split_detection(detections[1], min(2, n_thrusters - 1)))
-    if len(detections) == 3 and n_thrusters >= 3:
-        candidates.extend(split_detection(detections[0], min(3, n_thrusters)))
+    if len(detections) >= n_thrusters:
+        direct = [(float(d["cx"]), float(d["cy"])) for d in detections[:n_thrusters]]
+        return order_thruster_points(direct, None)
 
-    candidates = dedupe_points(candidates, 6.0)
-    if cfg.init_point_px is not None:
-        candidates.sort(key=lambda p: dist(p, cfg.init_point_px))
-    if len(candidates) < n_thrusters:
+    if not detections:
         return []
 
-    best: ThrusterPoints = []
-    best_score = math.inf
-    candidate_limit = min(len(candidates), max(n_thrusters + 10, 14))
-    for combo in combinations(candidates[:candidate_limit], n_thrusters):
-        points = list(combo)
-        min_pair_distance, max_pair_distance = distance_stats(points)
-        if min_pair_distance < 8.0:
-            continue
-        if max_pair_distance > cfg.max_thruster_distance_px * 2.2:
-            continue
+    points: ThrusterPoints = [(float(d["cx"]), float(d["cy"])) for d in detections]
+    remaining = n_thrusters - len(points)
+    det_index = 0
+    while remaining > 0 and det_index < len(detections):
+        splits = min(remaining + 1, 3)
+        split_points = split_detection(detections[det_index], splits)
+        if len(split_points) == splits:
+            if det_index < len(points):
+                points.pop(det_index)
+            points.extend(split_points)
+            remaining = n_thrusters - len(points)
+        det_index += 1
 
-        centroid = (
-            sum(p[0] for p in points) / n_thrusters,
-            sum(p[1] for p in points) / n_thrusters,
-        )
-        ordered = order_thruster_points(points, None)
-        angles = [math.atan2(p[1] - centroid[1], p[0] - centroid[0]) for p in ordered]
-        unwrapped = angles + [angles[0] + 2.0 * math.pi]
-        ideal_gap = (2.0 * math.pi) / n_thrusters
-        gap_penalty = sum(abs((unwrapped[i + 1] - unwrapped[i]) - ideal_gap) for i in range(n_thrusters))
-        score = 1.2 * gap_penalty + 0.02 * max_pair_distance - 0.01 * min_pair_distance
-        if cfg.init_point_px is not None:
-            score += 0.25 * dist(centroid, cfg.init_point_px)
-        score += sum(min(dist(p, q) for q in candidates[:candidate_limit] if q != p) for p in points) * 0.03
-        if score < best_score:
-            best_score = score
-            best = points
+    points = dedupe_points(points, 6.0)
+    if len(points) < n_thrusters:
+        candidates = extract_candidate_points(mask, detections, cfg, cfg.init_point_px)
+        points.extend(candidates)
+        points = dedupe_points(points, 6.0)
+    if len(points) < n_thrusters:
+        return []
 
-    if len(best) == n_thrusters:
-        ordered_best = order_thruster_points(best, None)
-        refined = refine_points_from_mask(mask, best, radius=max(cfg.min_thruster_distance_px * 0.75, 20.0))
-        refined = order_thruster_points(refined, None)
-        if len(refined) == n_thrusters and distance_stats(refined)[0] >= 6.0:
-            return refined
-        return ordered_best
-    return []
+    ordered = order_thruster_points(points[:n_thrusters], None)
+    refined = refine_points_from_mask(mask, ordered, radius=max(cfg.min_thruster_distance_px * 0.75, 20.0))
+    if len(refined) == n_thrusters and distance_stats(refined)[0] >= 6.0:
+        return order_thruster_points(refined, None)
+    return ordered
 
 
 def localize_thruster_point(
@@ -547,47 +541,100 @@ def localize_thruster_point(
     x1 = min(mask.shape[1], int(round(predicted[0])) + radius_px + 1)
     y0 = max(0, int(round(predicted[1])) - radius_px)
     y1 = min(mask.shape[0], int(round(predicted[1])) + radius_px + 1)
-    if x1 > x0 and y1 > y0:
-        roi = mask[y0:y1, x0:x1]
-        ys, xs = np.where(roi > 0)
-        if len(xs) >= 8:
-            global_x = xs.astype(np.float32) + x0
-            global_y = ys.astype(np.float32) + y0
-            d2 = (global_x - predicted[0]) ** 2 + (global_y - predicted[1]) ** 2
-            keep = d2 <= search_radius * search_radius
-            if int(np.count_nonzero(keep)) >= 8:
-                return (float(global_x[keep].mean()), float(global_y[keep].mean()))
+    if x1 <= x0 or y1 <= y0:
+        return None
+
+    roi = mask[y0:y1, x0:x1]
+    if int(np.count_nonzero(roi)) < 6:
+        return None
+
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(roi)
+    best_point: Optional[Point] = None
+    best_score = math.inf
+    for label in range(1, num_labels):
+        area = int(stats[label, cv2.CC_STAT_AREA])
+        if area < 6:
+            continue
+        cx = float(centroids[label][0] + x0)
+        cy = float(centroids[label][1] + y0)
+        point = (cx, cy)
+        jump = dist(point, predicted)
+        if jump > search_radius:
+            continue
+        score = jump - 0.02 * area
+        if score < best_score:
+            best_score = score
+            best_point = point
+    if best_point is not None:
+        return best_point
     return None
+
+
+def clamp_vector(vec: Point, max_norm: float) -> Point:
+    norm = math.hypot(vec[0], vec[1])
+    if norm <= max_norm or norm <= 1e-9:
+        return vec
+    scale = max_norm / norm
+    return (vec[0] * scale, vec[1] * scale)
 
 
 def track_fixed_thrusters(
     mask: np.ndarray,
     cfg: TrackerConfig,
     prev_thruster_points: ThrusterPoints,
-    velocity: Point,
-) -> ThrusterPoints:
+    prev_thruster_velocities: Optional[ThrusterVelocities],
+    centroid_velocity: Point,
+) -> Tuple[ThrusterPoints, bool]:
     if len(prev_thruster_points) != target_thruster_count(cfg):
-        return []
+        return [], False
 
+    working_mask = mask.copy()
     tracked: ThrusterPoints = []
-    search_radius = max(cfg.min_thruster_distance_px * 0.9, 24.0)
-    for prev_point in prev_thruster_points:
-        predicted = (prev_point[0] + velocity[0], prev_point[1] + velocity[1])
-        localized = localize_thruster_point(mask, predicted, cfg, search_radius)
+    had_hold = False
+    search_radius = max(8.0, float(cfg.thruster_search_radius_px))
+    reacquire_radius = max(search_radius, float(cfg.thruster_reacquire_radius_px))
+    erase_radius = max(8, int(round(cfg.min_thruster_distance_px * 0.45)))
+    for idx, prev_point in enumerate(prev_thruster_points):
+        used_hold = False
+        point_velocity = centroid_velocity
+        if prev_thruster_velocities is not None and idx < len(prev_thruster_velocities):
+            local_velocity = clamp_vector(prev_thruster_velocities[idx], float(cfg.thruster_max_step_px))
+            centroid_velocity_clamped = clamp_vector(centroid_velocity, float(cfg.thruster_max_step_px))
+            point_velocity = (
+                0.7 * local_velocity[0] + 0.3 * centroid_velocity_clamped[0],
+                0.7 * local_velocity[1] + 0.3 * centroid_velocity_clamped[1],
+            )
+        point_velocity = clamp_vector(point_velocity, float(cfg.thruster_max_step_px))
+        predicted = (prev_point[0] + point_velocity[0], prev_point[1] + point_velocity[1])
+        localized = localize_thruster_point(working_mask, predicted, cfg, search_radius)
         if localized is None:
-            localized = localize_thruster_point(mask, predicted, cfg, search_radius * 1.6)
+            localized = localize_thruster_point(working_mask, prev_point, cfg, search_radius)
         if localized is None:
-            return []
+            localized = localize_thruster_point(working_mask, predicted, cfg, reacquire_radius)
+        if localized is None:
+            localized = localize_thruster_point(working_mask, prev_point, cfg, reacquire_radius)
+        if localized is None:
+            localized = prev_point
+            had_hold = True
+            used_hold = True
         if any(dist(localized, other) < cfg.min_thruster_distance_px * 0.6 for other in tracked):
-            return []
+            return [], False
         tracked.append(localized)
+        if not used_hold:
+            cv2.circle(
+                working_mask,
+                (int(round(localized[0])), int(round(localized[1]))),
+                erase_radius,
+                0,
+                thickness=-1,
+            )
 
     min_pair_distance, max_pair_distance = distance_stats(tracked)
     if min_pair_distance < cfg.min_thruster_distance_px * 0.55:
-        return []
+        return [], False
     if max_pair_distance > cfg.max_thruster_distance_px * 1.25:
-        return []
-    return tracked
+        return [], False
+    return tracked, had_hold
 
 
 def estimate_thruster_points(
@@ -676,18 +723,26 @@ def choose_robot_position(
     prev_pos: Optional[Point],
     velocity: Point,
     prev_thruster_points: Optional[ThrusterPoints],
-) -> Tuple[ThrusterPoints, Optional[Point], float, int, bool]:
+    prev_thruster_velocities: Optional[ThrusterVelocities],
+) -> Tuple[ThrusterPoints, Optional[Point], float, int, bool, str]:
     """
     Estimates four thruster points from the orange mask and returns their centroid.
     Returns: thruster_points, centroid_px, total_area, n_thrusters, detected_reliably
     """
     if not detections:
-        return [], None, 0.0, 0, False
+        return [], None, 0.0, 0, False, "none"
 
     n_thrusters = target_thruster_count(cfg)
-    thruster_points = estimate_thruster_points(mask, detections, cfg, prev_pos, velocity, prev_thruster_points)
+    thruster_points: ThrusterPoints = []
+    tracking_mode = "global"
+    if prev_thruster_points is not None and len(prev_thruster_points) == n_thrusters:
+        thruster_points, had_hold = track_fixed_thrusters(mask, cfg, prev_thruster_points, prev_thruster_velocities, velocity)
+        if len(thruster_points) == n_thrusters:
+            tracking_mode = "hold" if had_hold else "roi"
     if len(thruster_points) != n_thrusters:
-        return [], None, 0.0, len(thruster_points), False
+        thruster_points = estimate_thruster_points(mask, detections, cfg, prev_pos, velocity, prev_thruster_points)
+    if len(thruster_points) != n_thrusters:
+        return [], None, 0.0, len(thruster_points), False, "none"
 
     cx = sum(p[0] for p in thruster_points) / n_thrusters
     cy = sum(p[1] for p in thruster_points) / n_thrusters
@@ -705,8 +760,8 @@ def choose_robot_position(
             jump = dist(centroid, prev_pos)
             reliable = jump <= reacquire_limit
             if not reliable:
-                return [], None, total_area, len(thruster_points), False
-    return thruster_points, centroid, total_area, len(thruster_points), reliable
+                return [], None, total_area, len(thruster_points), False, tracking_mode
+    return thruster_points, centroid, total_area, len(thruster_points), reliable, tracking_mode
 
 
 def compute_speeds(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -757,6 +812,8 @@ def draw_annotation(
     frame: np.ndarray,
     detections: List[Dict[str, float]],
     thruster_points: ThrusterPoints,
+    roi_centers: Optional[ThrusterPoints],
+    tracking_mode: str,
     pos_px: Optional[Point],
     pool_xy: Tuple[float, float],
     trail: List[Point],
@@ -776,15 +833,32 @@ def draw_annotation(
         x, y, w, h = int(d["x"]), int(d["y"]), int(d["w"]), int(d["h"])
         cv2.rectangle(out, (x, y), (x + w, y + h), (0, 128, 255), 1)
 
+    if roi_centers is not None:
+        search_radius = max(1, int(round(float(cfg.thruster_search_radius_px))))
+        reacquire_radius = max(search_radius, int(round(float(cfg.thruster_reacquire_radius_px))))
+        for i, center in enumerate(roi_centers, start=1):
+            x, y = int(round(center[0])), int(round(center[1]))
+            cv2.circle(out, (x, y), reacquire_radius, (255, 255, 0), 1)
+            cv2.circle(out, (x, y), search_radius, (255, 0, 0), 1)
+            cv2.drawMarker(out, (x, y), (255, 255, 0), cv2.MARKER_TILTED_CROSS, 10, 1)
+            cv2.putText(out, f"R{i}", (x + 5, y + 14), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 3, cv2.LINE_AA)
+            cv2.putText(out, f"R{i}", (x + 5, y + 14), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 0), 1, cv2.LINE_AA)
+
     if len(trail) >= 2:
         pts = np.array([(int(x), int(y)) for x, y in trail[-200:]], dtype=np.int32)
         cv2.polylines(out, [pts], False, (0, 255, 0), 2)
 
+    if tracking_mode == "roi":
+        thruster_color = (0, 165, 255)
+    elif tracking_mode == "hold":
+        thruster_color = (0, 255, 255)
+    else:
+        thruster_color = (0, 0, 255)
     for i, point in enumerate(thruster_points, start=1):
         x, y = int(point[0]), int(point[1])
-        cv2.circle(out, (x, y), 7, (0, 165, 255), 2)
+        cv2.circle(out, (x, y), 7, thruster_color, 2)
         cv2.putText(out, str(i), (x + 6, y - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 3, cv2.LINE_AA)
-        cv2.putText(out, str(i), (x + 6, y - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 1, cv2.LINE_AA)
+        cv2.putText(out, str(i), (x + 6, y - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.6, thruster_color, 1, cv2.LINE_AA)
 
     if pos_px is not None:
         x, y = int(pos_px[0]), int(pos_px[1])
@@ -799,7 +873,8 @@ def draw_annotation(
     else:
         label2 = "position=NaN"
     label3 = f"thrusters={len(thruster_points)}/{n_thrusters}"
-    for i, text in enumerate([label1, label2, label3]):
+    label4 = f"tracking={tracking_mode}"
+    for i, text in enumerate([label1, label2, label3, label4]):
         y = 35 + i * 32
         cv2.putText(out, text, (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 4, cv2.LINE_AA)
         cv2.putText(out, text, (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
@@ -847,6 +922,7 @@ def track_video(args: argparse.Namespace) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     prev_pos: Optional[Point] = None
     prev_thruster_points: Optional[ThrusterPoints] = initial_thruster_points if len(initial_thruster_points) == n_thrusters else None
+    prev_prev_thruster_points: Optional[ThrusterPoints] = None
     smoothed_pos: Optional[Point] = None
     velocity: Point = (0.0, 0.0)
     trail: List[Point] = []
@@ -856,6 +932,7 @@ def track_video(args: argparse.Namespace) -> List[Dict[str, Any]]:
     pending_first_detections = initial_detections
     pending_first_mask = initial_mask
     while True:
+        roi_centers: Optional[ThrusterPoints] = None
         if pending_first_frame is not None:
             frame = pending_first_frame
             detections = pending_first_detections
@@ -876,14 +953,42 @@ def track_video(args: argparse.Namespace) -> List[Dict[str, Any]]:
             area = float(sum(max(d["area"], 1.0) for d in detections))
             n_cluster = n_thrusters
             reliable = True
+            tracking_mode = "init"
         else:
-            thruster_points, raw_pos, area, n_cluster, reliable = choose_robot_position(
+            point_velocities: Optional[ThrusterVelocities] = None
+            if (
+                prev_thruster_points is not None
+                and prev_prev_thruster_points is not None
+                and len(prev_thruster_points) == len(prev_prev_thruster_points) == n_thrusters
+            ):
+                point_velocities = [
+                    (
+                        prev_thruster_points[i][0] - prev_prev_thruster_points[i][0],
+                        prev_thruster_points[i][1] - prev_prev_thruster_points[i][1],
+                    )
+                    for i in range(n_thrusters)
+                ]
+            if prev_thruster_points is not None and len(prev_thruster_points) == n_thrusters:
+                roi_centers = []
+                for i, prev_point in enumerate(prev_thruster_points):
+                    point_velocity = velocity
+                    if point_velocities is not None and i < len(point_velocities):
+                        local_velocity = clamp_vector(point_velocities[i], float(cfg.thruster_max_step_px))
+                        centroid_velocity_clamped = clamp_vector(velocity, float(cfg.thruster_max_step_px))
+                        point_velocity = (
+                            0.7 * local_velocity[0] + 0.3 * centroid_velocity_clamped[0],
+                            0.7 * local_velocity[1] + 0.3 * centroid_velocity_clamped[1],
+                        )
+                    point_velocity = clamp_vector(point_velocity, float(cfg.thruster_max_step_px))
+                    roi_centers.append((prev_point[0] + point_velocity[0], prev_point[1] + point_velocity[1]))
+            thruster_points, raw_pos, area, n_cluster, reliable, tracking_mode = choose_robot_position(
                 detections,
                 mask,
                 cfg,
                 prev_pos,
                 velocity,
                 prev_thruster_points,
+                point_velocities,
             )
         detected = raw_pos is not None and reliable
 
@@ -899,6 +1004,7 @@ def track_video(args: argparse.Namespace) -> List[Dict[str, Any]]:
             if prev_pos is not None:
                 velocity = (smoothed_pos[0] - prev_pos[0], smoothed_pos[1] - prev_pos[1])
             prev_pos = smoothed_pos
+            prev_prev_thruster_points = prev_thruster_points
             prev_thruster_points = thruster_points
             pos_for_output: Optional[Point] = smoothed_pos
             trail.append(smoothed_pos)
@@ -932,7 +1038,7 @@ def track_video(args: argparse.Namespace) -> List[Dict[str, Any]]:
         rows.append(row)
 
         if writer is not None:
-            annotated = draw_annotation(frame, detections, thruster_points, pos_for_output, pool_xy, trail, cfg, frame_idx, time_s, detected)
+            annotated = draw_annotation(frame, detections, thruster_points, roi_centers, tracking_mode, pos_for_output, pool_xy, trail, cfg, frame_idx, time_s, detected)
             writer.write(annotated)
 
         frame_idx += 1

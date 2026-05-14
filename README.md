@@ -96,6 +96,14 @@ uv run python main.py movie/20260509_173657.mp4 \
 
 設定例は [`tracker_config_example.json`](./tracker_config_example.json) を参照してください。
 
+スラスタ数を変更したい場合は、設定ファイルに `num_thrusters` を追加します。例:
+
+```json
+{
+  "num_thrusters": 5
+}
+```
+
 ### 4. トラッキングを実行する
 
 ```bash
@@ -112,6 +120,22 @@ uv run python main.py movie/20260509_173657.mp4 \
 - 標準出力に総フレーム数、検出率、メートル座標範囲
 
 `num_thrusters` を設定すると、`orange_preview` ではその数を超える番号付きマーカーを表示しません。
+たとえば `num_thrusters=5` にすると、preview は最大5件まで表示され、CSV には `thruster_5_x`, `thruster_5_y` まで出力されます。
+
+`num_thrusters=5` の設定ファイルを使う例:
+
+```bash
+uv run python main.py movie/20260509_173721.mp4 \
+  --config /tmp/tracker_config_5.json \
+  --reference-frame 1 \
+  --export-orange-preview orange_preview_5.jpg
+```
+
+```bash
+uv run python main.py movie/20260509_173721.mp4 \
+  --config /tmp/tracker_config_5.json \
+  --csv positions_5.csv
+```
 
 ## 出力 CSV
 
@@ -149,6 +173,8 @@ CSV には以下の列が出力されます。
   - 追跡対象とみなすスラスタ数。`orange_preview` の表示数と CSV のスラスタ列数にも反映
 - `min_thruster_distance_px`, `max_thruster_distance_px`
   - スラスタ点同士の距離制約
+- `thruster_search_radius_px`, `thruster_reacquire_radius_px`
+  - 各スラスタを前フレーム近傍で個別追跡するときの通常探索半径と再取得半径
 - `orange_clahe_clip_limit`
   - オレンジ抽出前の CLAHE 強度
 - `orange_red_minus_green_min`, `orange_green_minus_blue_min`
