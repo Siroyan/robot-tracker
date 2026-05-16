@@ -1,6 +1,6 @@
 import argparse
 
-from app import make_config_headless, save_orange_preview, save_reference_frame, track_video
+from pipeline import make_config_headless, save_orange_preview, save_reference_frame, track_video
 from config import TrackerConfig, load_config, parse_point_text
 
 

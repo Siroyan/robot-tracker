@@ -285,7 +285,7 @@ CSV には以下の列を出力します。
   - 初期スラスタ選定と個別 ROI 追跡
 - [`src/output.py`](./src/output.py)
   - CSV 出力、速度計算、注釈描画
-- [`src/app.py`](./src/app.py)
+- [`src/pipeline.py`](./src/pipeline.py)
   - 参照画像出力、プレビュー、設定生成、動画処理本体
 - [`src/cli.py`](./src/cli.py)
   - CLI 引数定義と実行フロー
