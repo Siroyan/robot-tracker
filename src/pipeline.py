@@ -1,4 +1,5 @@
 import math
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import cv2
@@ -224,8 +225,11 @@ def track_video(
     cap.set(cv2.CAP_PROP_POS_FRAMES, 1)
     writer = None
     if annotated_path:
+        annotated_output_path = Path(annotated_path)
+        if annotated_output_path.parent != Path("."):
+            annotated_output_path.parent.mkdir(parents=True, exist_ok=True)
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        writer = cv2.VideoWriter(annotated_path, fourcc, fps if fps > 0 else 30.0, (width, height))
+        writer = cv2.VideoWriter(str(annotated_output_path), fourcc, fps if fps > 0 else 30.0, (width, height))
         if not writer.isOpened():
             raise RuntimeError(f"Cannot write annotated video: {annotated_path}")
 
@@ -310,6 +314,7 @@ def track_video(
     cap.release()
     if writer is not None:
         writer.release()
+        print(f"Saved annotated video: {annotated_path}")
 
     if homography is not None:
         rows = compute_speeds(rows)

@@ -1,4 +1,5 @@
 import argparse
+from pathlib import Path
 
 from pipeline import make_config_headless, save_orange_preview, save_reference_frame, track_video
 from config import TrackerConfig, load_config, parse_point_text
@@ -45,6 +46,18 @@ def build_runtime_config(args: argparse.Namespace) -> TrackerConfig:
     return cfg
 
 
+def default_csv_path(video_path: str) -> str:
+    """Return the default CSV path derived from the input video file name."""
+    video_name = Path(video_path).stem
+    return str(Path("csv") / f"{video_name}_csv.csv")
+
+
+def default_annotated_path(video_path: str) -> str:
+    """Return the default annotation video path derived from the input video file name."""
+    video_name = Path(video_path).stem
+    return str(Path("annotation") / f"{video_name}_annotation.mp4")
+
+
 def main() -> None:
     """CLI entrypoint that routes export, config generation, and tracking modes."""
     # まずCLI引数を読み取り、必要に応じてJSON設定とマージする。
@@ -75,15 +88,18 @@ def main() -> None:
             init_point_px=args.init_point_px,
         )
         return
-    if did_export and not args.annotated and args.csv is None:
-        # プレビュー/参照画像だけが要求された場合は、CSVや注釈動画の指定がない限り
+    if did_export and args.annotated is None and args.csv is None:
+        # プレビュー/参照画像だけが要求された場合は、明示的な出力指定がない限り
         # フルトラッキングを実行しない。
         return
     if args.csv is None:
-        # トラッキング時は必ずCSVを出力するため、省略時は固定のデフォルト名を使う。
-        args.csv = "positions.csv"
+        # トラッキング時は必ずCSVを出力する。省略時は入力動画名から出力先を決める。
+        args.csv = default_csv_path(args.video)
+    if args.annotated is None:
+        # トラッキング時は必ず注釈動画を出力する。省略時は入力動画名から出力先を決める。
+        args.annotated = default_annotated_path(args.video)
 
-    # 通常実行パスでは、動画全体を処理し、必要に応じて注釈付きMP4も出力する。
+    # 通常実行パスでは、動画全体を処理し、CSVと注釈付きMP4を出力する。
     rows = track_video(
         args.video,
         cfg,

@@ -1,5 +1,6 @@
 import csv
 import math
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
@@ -47,7 +48,10 @@ def write_csv(rows: List[Dict[str, Any]], path: str, num_thrusters: int) -> None
     ]
     for idx in range(1, num_thrusters + 1):
         fieldnames.extend([f"thruster_{idx}_x", f"thruster_{idx}_y"])
-    with open(path, "w", newline="", encoding="utf-8") as f:
+    output_path = Path(path)
+    if output_path.parent != Path("."):
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         for row in rows:

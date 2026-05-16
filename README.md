@@ -98,10 +98,11 @@ uv run python main.py movie/20260509_173657.mp4 \
 
 ```bash
 uv run python main.py movie/20260509_173657.mp4 \
-  --config tracker_config.json \
-  --csv positions.csv \
-  --annotated annotated.mp4
+  --config tracker_config.json
 ```
+
+`--csv` を省略した場合もCSVは必ず生成されます。出力先は `csv/<入力動画ファイル名>_csv.csv` です。例えば `movie/20260509_173657.mp4` なら `csv/20260509_173657_csv.csv` に保存されます。
+`--annotated` を省略した場合も注釈動画は必ず生成されます。出力先は `annotation/<入力動画ファイル名>_annotation.mp4` です。例えば `movie/20260509_173657.mp4` なら `annotation/20260509_173657_annotation.mp4` に保存されます。
 
 標準出力には以下を出します。
 
@@ -198,11 +199,12 @@ uv run python main.py movie/20260509_173721.mp4 \
 
 ```bash
 uv run python main.py movie/20260509_173721.mp4 \
-  --config /tmp/tracker_config_5.json \
-  --csv positions_5.csv
+  --config /tmp/tracker_config_5.json
 ```
 
 ## 出力 CSV
+
+CSV は `--csv` の指定がない場合も生成されます。デフォルトの出力先は `csv/<入力動画ファイル名>_csv.csv` です。`--csv` を指定した場合は、そのパスへ出力します。
 
 CSV には以下の列を出力します。
 
@@ -219,6 +221,10 @@ CSV には以下の列を出力します。
 - `thruster_1_x`, `thruster_1_y` ... `thruster_N_x`, `thruster_N_y`: 各スラスタの画素座標
 
 プール四隅またはプール実寸が未設定の場合、`pool_x_m`、`pool_y_m`、`speed_mps` は `NaN` です。
+
+## 出力 注釈動画
+
+注釈動画は `--annotated` の指定がない場合も生成されます。デフォルトの出力先は `annotation/<入力動画ファイル名>_annotation.mp4` です。`--annotated` を指定した場合は、そのパスへ出力します。
 
 ## 設定項目
 

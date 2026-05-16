@@ -22,6 +22,8 @@ dist/
 
 # Generated tracker outputs
 movie/
+csv/
+annotation/
 positions.csv
 annotated.mp4
 reference.jpg
