@@ -33,13 +33,11 @@
 
 ```bash
 uv sync
-uv pip install -r requirements_tracker.txt
 ```
 
 補足:
 
-- 現在の `pyproject.toml` には `dependencies` が入っていません。
-- 実際の依存は [`requirements_tracker.txt`](./requirements_tracker.txt) にあります。
+- 依存関係は `pyproject.toml` と `uv.lock` で管理しています。
 
 ## 典型的な使い方
 
@@ -315,7 +313,3 @@ CSV には以下の列を出力します。
   - 共有する型定義
 - [`tracker_config_example.json`](./tracker_config_example.json)
   - 設定例
-- [`requirements_tracker.txt`](./requirements_tracker.txt)
-  - 依存一覧
-- [`positions_pixels.csv`](./positions_pixels.csv)
-  - 出力例
