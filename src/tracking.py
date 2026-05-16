@@ -16,6 +16,7 @@ def _thruster_velocity(
     centroid_velocity: Point,
     point_velocity: Optional[Point],
 ) -> Point:
+    # スラスタ別速度で各IDを直前の動きに寄せつつ、履歴が足りない場合は重心速度で補う。
     if point_velocity is None:
         return clamp_vector(centroid_velocity, float(cfg.thruster_max_step_px))
     local_velocity = clamp_vector(point_velocity, float(cfg.thruster_max_step_px))
@@ -57,6 +58,7 @@ def order_thruster_points(points: ThrusterPoints, prev_points: Optional[Thruster
     if len(points) <= 1:
         return points
     if prev_points is None:
+        # 初期フレームではID履歴がないため、重心まわりの角度で決定的な順序にする。
         n_points = len(points)
         centroid = (
             sum(point[0] for point in points) / n_points,
@@ -66,6 +68,7 @@ def order_thruster_points(points: ThrusterPoints, prev_points: Optional[Thruster
 
     best: Optional[ThrusterPoints] = None
     best_score = math.inf
+    # 2フレーム目以降は、IDごとの移動量が最小になる並びを選ぶ。
     for perm in permutations(points):
         score = sum(dist(perm[i], prev_points[i]) for i in range(len(points)))
         if score < best_score:
@@ -76,6 +79,7 @@ def order_thruster_points(points: ThrusterPoints, prev_points: Optional[Thruster
 
 def suppress_nearby_points(points: List[Tuple[float, float, float]], min_distance: float) -> ThrusterPoints:
     kept: ThrusterPoints = []
+    # 1つのblobに複数候補が乗った場合は、スコアが高い候補を残す。
     for x, y, _score in sorted(points, key=lambda item: item[2], reverse=True):
         point = (float(x), float(y))
         if all(dist(point, other) >= min_distance for other in kept):
@@ -92,6 +96,8 @@ def dedupe_points(points: ThrusterPoints, min_distance: float) -> ThrusterPoints
 
 
 def refine_points_from_mask(mask: np.ndarray, seeds: ThrusterPoints, radius: float) -> ThrusterPoints:
+    # 各seedを近傍のマスク画素の重心へ寄せ直す。
+    # これにより、k-meansやピーク検出の点がスラスタ中心から少し外れた場合を補正する。
     ys, xs = np.where(mask > 0)
     if len(xs) == 0:
         return []
@@ -109,6 +115,8 @@ def refine_points_from_mask(mask: np.ndarray, seeds: ThrusterPoints, radius: flo
 
 def split_detection_points(mask: np.ndarray, detection: Detection, n_splits: int) -> ThrusterPoints:
     """Split one merged detection into multiple point candidates with k-means."""
+    # 隣接するスラスタが1つの輪郭に結合することがあるため、
+    # 画像全体ではなく輪郭の矩形内だけでk-means分割する。
     x0 = max(0, int(detection["x"]) - 4)
     y0 = max(0, int(detection["y"]) - 4)
     x1 = min(mask.shape[1], int(detection["x"] + detection["w"]) + 4)
@@ -125,6 +133,8 @@ def split_detection_points(mask: np.ndarray, detection: Detection, n_splits: int
 
 def mask_peak_candidates(mask: np.ndarray, min_peak_score: float) -> List[Tuple[float, float, float]]:
     """Extract candidate points from the distance-transform peaks of a mask."""
+    # 距離変換のピークはオレンジblobの中心付近に出やすく、
+    # 全マスク画素を候補にするより安定した点になる。
     dt = cv2.distanceTransform(mask, cv2.DIST_L2, 5)
     if float(dt.max()) <= 0.0:
         return []
@@ -148,6 +158,7 @@ def extract_candidate_points(
     cfg: TrackerConfig,
     search_center: Optional[Point],
 ) -> ThrusterPoints:
+    # blob中心とマスクピークを統合し、1つの物理スラスタから近接候補が複数出ないように間引く。
     candidates = mask_peak_candidates(mask, 1.0)
     for detection in detections:
         score = math.sqrt(max(float(detection["area"]), 1.0))
@@ -166,12 +177,15 @@ def select_initial_thruster_points(mask: np.ndarray, detections: List[Detection]
     """Estimate initial thruster points from the first frame only."""
     n_thrusters = target_thruster_count(cfg)
 
+    # 初期フレームで十分な輪郭検出がある場合は、大きい候補を信頼しID順だけ整える。
     if len(detections) >= n_thrusters:
         direct = [(float(item["cx"]), float(item["cy"])) for item in detections[:n_thrusters]]
         return order_thruster_points(direct, None)
     if not detections:
         return []
 
+    # 複数スラスタが1つの輪郭に結合した可能性がある場合は、
+    # 広いピーク抽出へ進む前に輪郭内分割を試す。
     points: ThrusterPoints = [(float(item["cx"]), float(item["cy"])) for item in detections]
     remaining = n_thrusters - len(points)
     det_index = 0
@@ -187,12 +201,15 @@ def select_initial_thruster_points(mask: np.ndarray, detections: List[Detection]
 
     points = dedupe_points(points, 6.0)
     if len(points) < n_thrusters:
+        # 初期フレームの最後のフォールバックとして距離変換ピークも使い、
+        # 輪郭分割で拾えなかった小さなオレンジ領域を候補に含める。
         points.extend(extract_candidate_points(mask, detections, cfg, cfg.init_point_px))
         points = dedupe_points(points, 6.0)
     if len(points) < n_thrusters:
         return []
 
     ordered = order_thruster_points(points[:n_thrusters], None)
+    # 並べた点をマスク画素上へ寄せ直し、2点が同じ物理スラスタへ潰れた場合は採用しない。
     refined = refine_points_from_mask(mask, ordered, radius=max(cfg.min_thruster_distance_px * 0.75, 20.0))
     if len(refined) == n_thrusters and distance_stats(refined)[0] >= 6.0:
         return order_thruster_points(refined, None)
@@ -201,6 +218,7 @@ def select_initial_thruster_points(mask: np.ndarray, detections: List[Detection]
 
 def localize_thruster_point(mask: np.ndarray, predicted: Point, search_radius: float) -> Optional[Point]:
     """Find the best connected component near a predicted thruster position."""
+    # 先にROIへ切り出し、プール内の無関係なオレンジ領域が候補に混ざらないようにする。
     radius_px = int(math.ceil(search_radius))
     x0 = max(0, int(round(predicted[0])) - radius_px)
     x1 = min(mask.shape[1], int(round(predicted[0])) + radius_px + 1)
@@ -217,6 +235,8 @@ def localize_thruster_point(mask: np.ndarray, predicted: Point, search_radius: f
     best_point: Optional[Point] = None
     best_score = math.inf
     for label in range(1, num_labels):
+        # 予測位置からの移動が小さい点を優先しつつ、近傍にノイズと実blobがある場合は
+        # 面積の小さな加点で実blobを選びやすくする。
         area = int(stats[label, cv2.CC_STAT_AREA])
         if area < 6:
             continue
@@ -241,6 +261,8 @@ def _localize_thruster_point(
     search_radius: float,
     reacquire_radius: float,
 ) -> Optional[Point]:
+    # まず厳しめマスクと予測位置を試し、その後段階的に探索を緩める。
+    # 誤検知を抑えるため、緩めマスクは最後に試す。
     for work_mask, center, radius in (
         (mask, predicted, search_radius),
         (mask, prev_point, search_radius),
@@ -272,6 +294,8 @@ def track_fixed_thrusters(
     working_mask = mask.copy()
     tracked: ThrusterPoints = []
     had_hold = False
+    # search_radiusは通常のROI。reacquire_radiusは予測点で失敗した後だけ使い、
+    # 通常追跡の範囲は狭く保つ。
     search_radius = max(8.0, float(cfg.thruster_search_radius_px))
     reacquire_radius = max(search_radius, float(cfg.thruster_reacquire_radius_px))
     erase_radius = max(8, int(round(cfg.min_thruster_distance_px * 0.45)))
@@ -279,15 +303,19 @@ def track_fixed_thrusters(
     for prev_point, predicted in zip(prev_thruster_points, predicted_points):
         localized = _localize_thruster_point(working_mask, relaxed_mask, prev_point, predicted, search_radius, reacquire_radius)
         used_hold = localized is None
+        # holdはROI内で信頼できるオレンジblobが見つからないIDについて、直前位置を維持する。
+        # これにより遠くの誤検知へ飛ぶことを避ける。
         localized = prev_point if localized is None else localized
         had_hold |= used_hold
         if any(dist(localized, other) < cfg.min_thruster_distance_px * 0.6 for other in tracked):
             return [], False
         tracked.append(localized)
         if not used_hold:
+            # 採用済みblobを作業用マスクから消し、次のIDが同じスラスタを再利用しないようにする。
             cv2.circle(working_mask, (int(round(localized[0])), int(round(localized[1]))), erase_radius, 0, thickness=-1)
 
     min_pair_distance, max_pair_distance = distance_stats(tracked)
+    # 幾何チェックで、重複点や1台のロボットとして広がりすぎた配置を棄却する。
     if min_pair_distance < cfg.min_thruster_distance_px * 0.55:
         return [], False
     if max_pair_distance > cfg.max_thruster_distance_px * 1.25:
@@ -316,6 +344,8 @@ def estimate_thruster_points(
     if len(xs) < n_thrusters:
         return []
 
+    # global推定は全オレンジ画素から始めるが、予測重心がある場合はその近傍へ絞り、
+    # 静的なオレンジ誤検知を避ける。
     points = np.column_stack([xs, ys]).astype(np.float32)
     search_center: Optional[Point] = None
     if prev_pos is not None:
@@ -331,11 +361,15 @@ def estimate_thruster_points(
             points = filtered
 
     if len(points) > 4000:
+        # 大きなマスクでk-meansの計算量が増えすぎないようにする。
+        # この経路では粗いクラスタ中心が取れればよいため、等間隔サンプリングで十分。
         idx = np.linspace(0, len(points) - 1, 4000, dtype=np.int32)
         points = points[idx]
 
     work_mask = mask.copy()
     if search_center is not None:
+        # globalフォールバックでも可能なら重心ROIを使う。
+        # ただし切り出しでほぼ全オレンジ画素が消える場合は、全体マスクを維持する。
         roi_radius = max(cfg.max_jump_px * 1.25, cfg.cluster_radius_px * 3.2)
         roi = np.zeros_like(mask)
         cv2.circle(roi, (int(search_center[0]), int(search_center[1])), int(roi_radius), 255, -1)
@@ -345,6 +379,7 @@ def estimate_thruster_points(
 
     peak_candidates = mask_peak_candidates(work_mask, 1.5)
     if peak_candidates:
+        # 距離変換ピークだけで、設定スラスタ数と妥当な間隔が揃う場合はk-meansより優先する。
         seeds = suppress_nearby_points(peak_candidates, cfg.min_thruster_distance_px)
         if len(seeds) == n_thrusters:
             refined = refine_points_from_mask(work_mask, seeds, radius=max(cfg.min_thruster_distance_px * 0.75, 20.0))
@@ -352,6 +387,8 @@ def estimate_thruster_points(
             if is_valid(refined):
                 return refined
 
+    # global推定の最後の手段として、オレンジ画素を設定スラスタ数にクラスタリングし、
+    # 各クラスタを近傍マスク画素へ寄せ直す。
     criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 1.0)
     _compactness, _labels, centers = cv2.kmeans(points, n_thrusters, None, criteria, 8, cv2.KMEANS_PP_CENTERS)
     thruster_points = [(float(centers[i, 0]), float(centers[i, 1])) for i in range(n_thrusters)]
@@ -380,10 +417,13 @@ def choose_robot_position(
 
     n_thrusters = target_thruster_count(cfg)
     thruster_points, tracking_mode = [], "global"
+    # 通常経路では、前フレームのスラスタ別位置の周辺だけを探して固定IDを維持する。
     if prev_thruster_points is not None and len(prev_thruster_points) == n_thrusters:
         thruster_points, had_hold = track_fixed_thrusters(mask, relaxed_mask, cfg, prev_thruster_points, prev_thruster_velocities, velocity)
         tracking_mode = "hold" if had_hold else "roi"
     if len(thruster_points) != n_thrusters:
+        # ROI追跡が幾何チェックに失敗した場合や候補不足の場合は、
+        # 復帰経路として現在フレームのマスクから全点を再構築する。
         thruster_points, tracking_mode = estimate_thruster_points(mask, detections, cfg, prev_pos, velocity, prev_thruster_points), "global"
     if len(thruster_points) != n_thrusters:
         return [], None, 0.0, len(thruster_points), False, "none"
@@ -393,6 +433,7 @@ def choose_robot_position(
 
     reliable = True
     if prev_pos is not None:
+        # 点推定が成功しても、平滑化済みのロボット移動と矛盾する重心ジャンプは棄却する。
         predicted = (prev_pos[0] + velocity[0], prev_pos[1] + velocity[1])
         reacquire_limit = max(cfg.max_jump_px * 2.0, cfg.cluster_radius_px * 3.0)
         reliable = dist(centroid, predicted) <= cfg.max_jump_px or dist(centroid, prev_pos) <= reacquire_limit

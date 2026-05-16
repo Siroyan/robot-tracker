@@ -79,6 +79,7 @@ uv run python main.py movie/20260509_173657.mp4 \
   --pool-width-m 2.0 \
   --pool-height-m 3.0 \
   --pool-corners-px 145,236 585,237 913,1097 -173,1088 \
+  --water-area-corners-px 160,250 570,250 870,1040 -120,1030 \
   --init-point-px 420,360
 ```
 
@@ -88,6 +89,8 @@ uv run python main.py movie/20260509_173657.mp4 \
 2. top-right
 3. bottom-right
 4. bottom-left
+
+`--water-area-corners-px` も同じ順序で指定します。未指定の場合は、従来どおり `pool_corners_px` の内側だけをスラスタ検出範囲として使います。
 
 設定例は [`tracker_config_example.json`](./tracker_config_example.json) を参照してください。
 
@@ -121,10 +124,19 @@ uv run python main.py movie/20260509_173657.mp4 \
 - ROI 円
   - 内側の青円: 通常探索半径 `thruster_search_radius_px`
   - 外側の水色円: 再取得半径 `thruster_reacquire_radius_px`
+- 四角形
+  - 水色: 距離変換に使う `pool_corners_px`
+  - 紫: スラスタ検出範囲に使う `water_area_corners_px`
 
 ## 追跡アルゴリズム
 
 現在の追跡は、大きく以下の段階で構成しています。
+
+0. 検出範囲の制限
+- オレンジ抽出は、まず水面領域マスクの内側に限定します。
+- `water_area_corners_px` が設定されている場合は、その四隅を検出範囲として使います。
+- 未設定の場合は後方互換のため、`pool_corners_px` の内側を検出範囲として使います。
+- `pool_corners_px` は引き続きメートル座標変換用の基準として使います。
 
 1. 初期フレームのスラスタ点決定
 - 初期フレームのオレンジ detection を使って、`num_thrusters` 個の初期スラスタ点を決めます。
@@ -237,7 +249,10 @@ CSV には以下の列を出力します。
 - `orange_min_red`, `orange_min_green`
   - RGB 成分の最小値条件
 - `pool_corners_px`
-  - プール領域の四隅画素座標
+  - メートル座標変換に使うプール四隅の画素座標
+- `water_area_corners_px`
+  - スラスタ検出範囲として使う水面領域の四隅画素座標
+  - 未指定の場合は `pool_corners_px` を検出範囲として使う
 - `pool_width_m`, `pool_height_m`
   - プール実寸
 - `init_point_px`
@@ -256,6 +271,7 @@ CSV には以下の列を出力します。
 - `--export-reference-frame`
 - `--export-orange-preview`
 - `--pool-corners-px`
+- `--water-area-corners-px`
 - `--init-point-px`
 - `--pool-width-m`, `--pool-height-m`
 - `--csv`

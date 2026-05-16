@@ -12,6 +12,12 @@ from tracking import choose_robot_position, predict_thruster_centers, select_ini
 from tracker_types import Point, ThrusterPoints, ThrusterVelocities
 
 
+def detection_area_corners(cfg: TrackerConfig) -> Optional[List[Point]]:
+    """Return the polygon used to limit orange detection."""
+    # 水面領域が指定されていれば検出範囲に使い、未指定なら従来どおりプール四隅を使う。
+    return cfg.water_area_corners_px if cfg.water_area_corners_px is not None else cfg.pool_corners_px
+
+
 def read_frame(video_path: str, frame_index: int) -> np.ndarray:
     """Load a single frame by index from a video file."""
     cap = cv2.VideoCapture(video_path)
@@ -37,9 +43,11 @@ def save_reference_frame(video_path: str, frame_index: int, output_path: str) ->
 def save_orange_preview(video_path: str, frame_index: int, output_path: str, cfg: TrackerConfig) -> None:
     """Export a preview image that overlays orange detections and initial thruster picks."""
     frame = read_frame(video_path, frame_index)
-    pool_mask = build_pool_mask(frame.shape, cfg.pool_corners_px)
+    pool_mask = build_pool_mask(frame.shape, detection_area_corners(cfg))
     detections, mask, _relaxed_mask = detect_orange_contours(frame, cfg, pool_mask)
     max_markers = target_thruster_count(cfg)
+    # プレビューでも本番と同じ初期フレーム選択ロジックを使い、
+    # 動画処理前にマーカー数や順序の問題を確認できるようにする。
     selected_points = select_initial_thruster_points(mask, detections, cfg)
     out = frame.copy()
     for detection in detections[: max(max_markers + 4, 8)]:
@@ -78,9 +86,11 @@ def make_config_headless(
     pool_width_m: Optional[float],
     pool_height_m: Optional[float],
     pool_corners_px: Optional[List[Point]],
+    water_area_corners_px: Optional[List[Point]],
     init_point_px: Optional[Point],
 ) -> None:
     """Build and save a config file from explicit headless inputs."""
+    # CLI解析はpipeline外に置き、この関数では検証済み入力を保存用設定へ写すだけにする。
     cfg.reference_frame = reference_frame
     cfg.pool_width_m = pool_width_m
     cfg.pool_height_m = pool_height_m
@@ -91,6 +101,11 @@ def make_config_headless(
         cfg.pool_corners_px = list(pool_corners_px)
     elif cfg.pool_width_m is not None or cfg.pool_height_m is not None:
         print("Warning: pool size is set but --pool-corners-px was not provided. Metric conversion will be disabled.")
+
+    if water_area_corners_px is not None:
+        if len(water_area_corners_px) != 4:
+            raise RuntimeError("--water-area-corners-px requires exactly 4 points: TL TR BR BL")
+        cfg.water_area_corners_px = list(water_area_corners_px)
 
     if init_point_px is not None:
         cfg.init_point_px = init_point_px
@@ -110,6 +125,8 @@ def track_video(
 ) -> List[Dict[str, Any]]:
     """Run the end-to-end tracking pipeline for one video."""
     def point_velocities() -> Optional[ThrusterVelocities]:
+        # スラスタ別速度は、安定した点数で2フレーム以上追跡できた後だけ使える。
+        # それまでは重心速度だけを使う。
         if prev_thruster_points is None or prev_prev_thruster_points is None:
             return None
         if len(prev_thruster_points) != len(prev_prev_thruster_points) or len(prev_thruster_points) != n_thrusters:
@@ -128,6 +145,8 @@ def track_video(
         mask: np.ndarray,
         relaxed_mask: np.ndarray,
     ) -> tuple[ThrusterPoints, Optional[Point], float, int, bool, str, Optional[ThrusterPoints]]:
+        # 0フレーム目だけは特別扱いし、このフレームだけを根拠に全スラスタIDを初期化する。
+        # 以降のフレームでは、その固定IDを追跡する。
         if frame_idx == 0 and len(initial_thruster_points) == n_thrusters:
             thruster_points = initial_thruster_points
             raw_pos = tuple(sum(point[i] for point in thruster_points) / n_thrusters for i in (0, 1))
@@ -136,6 +155,8 @@ def track_video(
         velocities = point_velocities()
         roi_centers = None
         if prev_thruster_points is not None and len(prev_thruster_points) == n_thrusters:
+            # ROI中心は注釈描画にも渡し、古い予測や誤った予測の周辺を探していないか
+            # 動画上で確認できるようにする。
             roi_centers = predict_thruster_centers(cfg, prev_thruster_points, velocities, velocity)
         thruster_points, raw_pos, area, n_cluster, reliable, tracking_mode = choose_robot_position(
             detections,
@@ -160,6 +181,8 @@ def track_video(
         detections: List[Dict[str, float]],
         thruster_points: ThrusterPoints,
     ) -> Dict[str, Any]:
+        # CSV列は設定されたスラスタ数で固定する。欠損点はNaNにして、
+        # 後段の解析で除外しやすくする。
         thruster_min_distance, thruster_max_distance = math.nan, math.nan
         thruster_xy = [(math.nan, math.nan)] * n_thrusters
         if len(thruster_points) == n_thrusters:
@@ -194,7 +217,7 @@ def track_video(
     first_ok, first_frame = cap.read()
     if not first_ok:
         raise RuntimeError("Cannot read first frame")
-    pool_mask = build_pool_mask(first_frame.shape, cfg.pool_corners_px)
+    pool_mask = build_pool_mask(first_frame.shape, detection_area_corners(cfg))
     homography = build_homography(cfg)
     initial_detections, initial_mask, initial_relaxed_mask = detect_orange_contours(first_frame, cfg, pool_mask)
     initial_thruster_points = select_initial_thruster_points(initial_mask, initial_detections, cfg)
@@ -215,6 +238,8 @@ def track_video(
     trail: List[Point] = []
 
     frame_idx = 0
+    # 初期化のために0フレーム目は読み込み済み。ここでキューに戻すことで、
+    # 出力ループでは後続フレームと同じ経路で0フレーム目を書き出せる。
     pending_first_frame: Optional[np.ndarray] = first_frame
     pending_first_detections = initial_detections
     pending_first_mask = initial_mask
@@ -239,6 +264,8 @@ def track_video(
 
         detected = raw_pos is not None and reliable
         if detected and raw_pos is not None:
+            # 平滑化するのはロボット重心だけにする。スラスタ点は平滑化せず、
+            # ROI予測には直近で測定したマーカー位置を使う。
             if smoothed_pos is None:
                 smoothed_pos = raw_pos
             else:
@@ -249,6 +276,7 @@ def track_video(
                 )
             if prev_pos is not None:
                 velocity = (smoothed_pos[0] - prev_pos[0], smoothed_pos[1] - prev_pos[1])
+            # 速度計算後に履歴を更新し、次フレームで重心移動とスラスタ別移動の両方を使えるようにする。
             prev_pos = smoothed_pos
             prev_prev_thruster_points = prev_thruster_points
             prev_thruster_points = thruster_points

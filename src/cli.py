@@ -14,6 +14,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--export-reference-frame", help="Save the reference frame as an image and exit unless --make-config is also specified")
     parser.add_argument("--export-orange-preview", help="Save a reference image with detected orange candidates and exit unless --make-config is also specified")
     parser.add_argument("--pool-corners-px", nargs=4, type=parse_point_text, metavar=("TL", "TR", "BR", "BL"), help="Pool corners in pixels: x,y x,y x,y x,y")
+    parser.add_argument("--water-area-corners-px", nargs=4, type=parse_point_text, metavar=("TL", "TR", "BR", "BL"), help="Water area corners used for orange detection: x,y x,y x,y x,y")
     parser.add_argument("--init-point-px", type=parse_point_text, help="Initial robot/thruster point in pixels: x,y")
     parser.add_argument("--pool-width-m", type=float, help="Real pool width in meters, mapped from top-left to top-right")
     parser.add_argument("--pool-height-m", type=float, help="Real pool height/length in meters, mapped from top-left to bottom-left")
@@ -37,6 +38,8 @@ def build_runtime_config(args: argparse.Namespace) -> TrackerConfig:
         cfg.hsv_upper = tuple(args.hsv_upper)
     if args.pool_corners_px is not None:
         cfg.pool_corners_px = list(args.pool_corners_px)
+    if args.water_area_corners_px is not None:
+        cfg.water_area_corners_px = list(args.water_area_corners_px)
     if args.init_point_px is not None:
         cfg.init_point_px = args.init_point_px
     return cfg
@@ -44,9 +47,13 @@ def build_runtime_config(args: argparse.Namespace) -> TrackerConfig:
 
 def main() -> None:
     """CLI entrypoint that routes export, config generation, and tracking modes."""
+    # まずCLI引数を読み取り、必要に応じてJSON設定とマージする。
+    # 以降の処理には、引数ではなくTrackerConfigを渡す。
     args = parse_args()
     cfg = build_runtime_config(args)
 
+    # 参照フレームやオレンジプレビューの出力は、キャリブレーションやデバッグ用の処理。
+    # --make-configとは併用できるが、単独なら重い動画処理に進まず終了できる。
     did_export = False
     if args.export_reference_frame:
         save_reference_frame(args.video, args.reference_frame, args.export_reference_frame)
@@ -55,6 +62,8 @@ def main() -> None:
         save_orange_preview(args.video, args.reference_frame, args.export_orange_preview, cfg)
         did_export = True
     if args.make_config:
+        # ここでは明示されたキャリブレーション入力だけを保存する。
+        # 出力先など実行時だけの指定は、設定ファイルに含めない。
         make_config_headless(
             cfg,
             args.make_config,
@@ -62,26 +71,33 @@ def main() -> None:
             pool_width_m=args.pool_width_m,
             pool_height_m=args.pool_height_m,
             pool_corners_px=args.pool_corners_px,
+            water_area_corners_px=args.water_area_corners_px,
             init_point_px=args.init_point_px,
         )
         return
     if did_export and not args.annotated and args.csv is None:
+        # プレビュー/参照画像だけが要求された場合は、CSVや注釈動画の指定がない限り
+        # フルトラッキングを実行しない。
         return
     if args.csv is None:
+        # トラッキング時は必ずCSVを出力するため、省略時は固定のデフォルト名を使う。
         args.csv = "positions.csv"
 
+    # 通常実行パスでは、動画全体を処理し、必要に応じて注釈付きMP4も出力する。
     rows = track_video(
         args.video,
         cfg,
         csv_path=args.csv,
         annotated_path=args.annotated,
     )
+    # 実行後に、検出率などの簡易確認用サマリを表示する。
     detected_rows = [row for row in rows if bool(row["detected"])]
     detected_ratio = len(detected_rows) / len(rows) if rows else 0.0
     print(f"Frames: {len(rows)}, detected: {detected_ratio * 100.0:.1f}%")
     xs = [row["pool_x_m"] for row in detected_rows if row["pool_x_m"] == row["pool_x_m"]]
     ys = [row["pool_y_m"] for row in detected_rows if row["pool_y_m"] == row["pool_y_m"]]
     if xs and ys:
+        # プール四隅と実寸から有効なホモグラフィが作れた場合のみ、メートル座標を表示する。
         print(f"Metric coordinate range: x={min(xs):.3f}..{max(xs):.3f} m, y={min(ys):.3f}..{max(ys):.3f} m")
 
 

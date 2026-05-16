@@ -11,6 +11,7 @@ Detection = Dict[str, float]
 
 def enhance_frame_for_orange(frame: np.ndarray, cfg: TrackerConfig) -> np.ndarray:
     """Apply contrast enhancement before orange color extraction."""
+    # CLAHEで局所コントラストを上げ、薄く写ったオレンジもHSV抽出に残りやすくする。
     lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
     l_channel, a_channel, b_channel = cv2.split(lab)
     clahe = cv2.createCLAHE(clipLimit=float(cfg.orange_clahe_clip_limit), tileGridSize=(8, 8))
@@ -39,6 +40,8 @@ def build_color_mask(
     upper = np.array(upper_hsv, dtype=np.uint8)
     mask_hsv = cv2.inRange(hsv, lower, upper)
     bgr_b, bgr_g, bgr_r = cv2.split(enhanced)
+    # HSVだけではプールの反射も拾うため、オレンジ色の素材に期待される
+    # RGBチャンネルの大小関係も条件に含める。
     orange_dominance = (
         (bgr_r.astype(np.int16) >= bgr_g.astype(np.int16) + int(cfg.orange_red_minus_green_min))
         & (bgr_g.astype(np.int16) >= bgr_b.astype(np.int16) + int(cfg.orange_green_minus_blue_min))
@@ -48,6 +51,7 @@ def build_color_mask(
     mask = cv2.bitwise_and(mask_hsv, orange_dominance.astype(np.uint8) * 255)
     if pool_mask is not None:
         mask = cv2.bitwise_and(mask, pool_mask)
+    # オープニングで孤立ノイズを消し、クロージングでスラスタ領域の小さな切れ目をつなぐ。
     if open_iterations > 0:
         open_kernel = np.ones((open_kernel_size, open_kernel_size), np.uint8)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, open_kernel, iterations=open_iterations)
@@ -62,6 +66,7 @@ def extract_detections_from_mask(mask: np.ndarray, cfg: TrackerConfig) -> List[D
     contours, _hierarchy = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     detections: List[Detection] = []
     for contour in contours:
+        # 面積で、小さすぎるノイズと大きすぎる非スラスタ領域を除外する。
         area = float(cv2.contourArea(contour))
         if area < cfg.min_area_px or area > cfg.max_area_px:
             continue
@@ -94,6 +99,7 @@ def detect_orange_contours(
     pool_mask: Optional[np.ndarray],
 ) -> Tuple[List[Detection], np.ndarray, np.ndarray]:
     """Return detections plus strict/relaxed masks for global and ROI tracking."""
+    # 誤検知が少ないため、まず厳しめのマスクを使う。
     mask = build_color_mask(
         frame,
         cfg,
@@ -107,6 +113,8 @@ def detect_orange_contours(
     )
     detections = extract_detections_from_mask(mask, cfg)
 
+    # 暗いフレームやブレたフレームで厳しめの条件が実スラスタを逃した場合に備え、
+    # ROI追跡用のフォールバックとして緩めのマスクも保持する。
     relaxed_lower = (
         max(0, int(cfg.hsv_lower[0]) - 10),
         max(0, int(cfg.hsv_lower[1]) - 40),
@@ -129,6 +137,7 @@ def detect_orange_contours(
         close_iterations=0,
     )
     relaxed_detections = extract_detections_from_mask(relaxed_mask, cfg)
+    # 厳しめの検出で候補がゼロの場合は、即座に空フレーム扱いせず緩めのマスクから開始する。
     if detections:
         return detections, mask, relaxed_mask
     return relaxed_detections, relaxed_mask, relaxed_mask

@@ -72,9 +72,18 @@ def draw_annotation(
     out = frame.copy()
     n_thrusters = target_thruster_count(cfg)
 
+    def draw_polygon(corners: List[Point], color: Tuple[int, int, int], label: str) -> None:
+        pts = np.array(corners, dtype=np.int32)
+        cv2.polylines(out, [pts], True, color, 2)
+        x, y = int(pts[0][0]), int(pts[0][1])
+        # 左上点の近くにラベルを出し、2つの四角形が重なっても用途を判別できるようにする。
+        cv2.putText(out, label, (x + 6, y - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 3, cv2.LINE_AA)
+        cv2.putText(out, label, (x + 6, y - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 1, cv2.LINE_AA)
+
     if cfg.pool_corners_px is not None:
-        pts = np.array(cfg.pool_corners_px, dtype=np.int32)
-        cv2.polylines(out, [pts], True, (255, 255, 0), 2)
+        draw_polygon(cfg.pool_corners_px, (255, 255, 0), "pool")
+    if cfg.water_area_corners_px is not None:
+        draw_polygon(cfg.water_area_corners_px, (255, 0, 255), "water")
 
     for detection in detections[:20]:
         x, y, w, h = int(detection["x"]), int(detection["y"]), int(detection["w"]), int(detection["h"])

@@ -27,6 +27,7 @@ class TrackerConfig:
     orange_min_red: int = 35
     orange_min_green: int = 20
     pool_corners_px: Optional[List[Point]] = None
+    water_area_corners_px: Optional[List[Point]] = None
     pool_width_m: Optional[float] = None
     pool_height_m: Optional[float] = None
     init_point_px: Optional[Point] = None
@@ -52,6 +53,8 @@ def load_config(path: Optional[str]) -> TrackerConfig:
     cfg.hsv_upper = tuple(cfg.hsv_upper)  # type: ignore[arg-type]
     if cfg.pool_corners_px is not None:
         cfg.pool_corners_px = [(float(x), float(y)) for x, y in cfg.pool_corners_px]
+    if cfg.water_area_corners_px is not None:
+        cfg.water_area_corners_px = [(float(x), float(y)) for x, y in cfg.water_area_corners_px]
     if cfg.init_point_px is not None:
         cfg.init_point_px = (float(cfg.init_point_px[0]), float(cfg.init_point_px[1]))
     return cfg
