@@ -181,6 +181,7 @@ def track_video(
         n_cluster: int,
         detections: List[Dict[str, float]],
         thruster_points: ThrusterPoints,
+        tracking_mode: str,
     ) -> Dict[str, Any]:
         # CSV列は設定されたスラスタ数で固定する。欠損点はNaNにして、
         # 後段の解析で除外しやすくする。
@@ -193,6 +194,7 @@ def track_video(
             "frame": frame_idx,
             "time_s": time_s,
             "detected": bool(detected),
+            "tracking": tracking_mode,
             "px_x": pos_for_output[0] if pos_for_output is not None else math.nan,
             "px_y": pos_for_output[1] if pos_for_output is not None else math.nan,
             "pool_x_m": pool_xy[0],
@@ -290,7 +292,20 @@ def track_video(
             pos_for_output = None
 
         pool_xy = transform_point(homography, pos_for_output)
-        rows.append(build_row(frame_idx, time_s, detected, pos_for_output, pool_xy, area, n_cluster, detections, thruster_points))
+        rows.append(
+            build_row(
+                frame_idx,
+                time_s,
+                detected,
+                pos_for_output,
+                pool_xy,
+                area,
+                n_cluster,
+                detections,
+                thruster_points,
+                tracking_mode,
+            )
+        )
 
         if writer is not None:
             annotated = draw_annotation(

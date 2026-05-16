@@ -108,6 +108,18 @@ uv run python main.py movie/20260509_173657.mp4 \
 - 検出率
 - 有効フレームのメートル座標範囲
 
+### 5. `movie/` 内の動画をまとめて解析する
+
+```bash
+tools/analyze_all_movies.sh
+```
+
+デフォルトでは [`tracker_config_example.json`](./tracker_config_example.json) を使います。別の設定ファイルを使う場合は、第一引数に指定します。
+
+```bash
+tools/analyze_all_movies.sh tracker_config.json
+```
+
 ## 注釈動画の見方
 
 - スラスタ番号の色
@@ -209,6 +221,7 @@ CSV には以下の列を出力します。
 - `frame`: フレーム番号
 - `time_s`: 動画先頭からの経過秒
 - `detected`: そのフレームで位置が確定したか
+- `tracking`: 追跡状態。`init`, `roi`, `hold`, `global`, `none` のいずれか
 - `px_x`, `px_y`: 平滑化後の重心画素座標
 - `pool_x_m`, `pool_y_m`: 射影変換後のプール座標
 - `speed_mps`: 前回有効点からの速度
@@ -311,5 +324,7 @@ CSV には以下の列を出力します。
   - CLI 引数定義と実行フロー
 - [`src/tracker_types.py`](./src/tracker_types.py)
   - 共有する型定義
+- [`tools/analyze_all_movies.sh`](./tools/analyze_all_movies.sh)
+  - `movie/` 内の動画をまとめて解析するシェルスクリプト
 - [`tracker_config_example.json`](./tracker_config_example.json)
   - 設定例

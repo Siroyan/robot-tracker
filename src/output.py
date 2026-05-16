@@ -35,6 +35,7 @@ def write_csv(rows: List[Dict[str, Any]], path: str, num_thrusters: int) -> None
         "frame",
         "time_s",
         "detected",
+        "tracking",
         "px_x",
         "px_y",
         "pool_x_m",
